@@ -41,13 +41,16 @@ class WorkingCaeTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), b'unchanged source')
                 self.assertIn('reference', database.models)
                 output = Path(folder)/'output.cae'
-                database.saveAs(pathName=str(output))
+                with mock.patch.object(contract.shutil, 'rmtree', side_effect=PermissionError('CAE still open')):
+                    database.saveAs(pathName=str(output))
+                    database.close()
+                    database.close()
                 self.assertEqual(output.read_bytes(), b'kernel writes even without explicit save')
-                self.assertFalse(staged[0].parent.exists())
-                database.close()
+                self.assertTrue(staged[0].is_file())
+                self.assertEqual(staged[0].read_bytes(), b'kernel writes even without explicit save')
             self.assertEqual(source.read_bytes(), b'unchanged source')
 
-    def test_failed_open_removes_only_temporary_cae(self):
+    def test_failed_open_preserves_working_cae_and_original_error(self):
         from pathlib import Path
         from types import SimpleNamespace as NS
         from unittest import mock
@@ -57,7 +60,10 @@ class WorkingCaeTests(unittest.TestCase):
             with mock.patch.dict('sys.modules', {'abaqus': NS(openMdb=mock.Mock(side_effect=RuntimeError('bad CAE')))}):
                 with self.assertRaisesRegex(RuntimeError, 'bad CAE'):
                     contract.open_working_mdb(str(source), folder)
-            self.assertEqual(list(Path(folder).iterdir()), [source])
+            working = list(Path(folder).glob('cfs_cae_work_*/reference.cae'))
+            self.assertEqual(len(working), 1)
+            self.assertEqual(working[0].read_bytes(), b'unchanged source')
+            self.assertEqual(source.read_bytes(), b'unchanged source')
 
 
 def valid_state(run_dir):

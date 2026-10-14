@@ -16,7 +16,7 @@ import tempfile
 
 
 class _WorkingModelDatabase:
-    """Delegate CAE operations while owning the temporary source opened by the kernel."""
+    """Delegate CAE operations and retain the working source for inspection."""
     def __init__(self, database, directory):
         self._database, self._directory = database, directory
         self._closed = False
@@ -24,32 +24,21 @@ class _WorkingModelDatabase:
     def __getattr__(self, name):
         return getattr(self._database, name)
 
-    def _cleanup(self):
-        if self._directory is not None:
-            shutil.rmtree(self._directory)
-            self._directory = None
-
     def saveAs(self, **kwargs):
-        result = self._database.saveAs(**kwargs)
-        self._cleanup()  # saveAs has released the old source and opened the output CAE.
-        return result
+        return self._database.saveAs(**kwargs)
 
     def close(self):
         if self._closed:
-            self._cleanup()
             return
-        try:
-            self._database.close()
-        finally:
-            self._closed = True
-            self._cleanup()
+        self._database.close()
+        self._closed = True
 
 
 def open_working_mdb(source_cae, scratch_dir=None):
-    """Open a disposable CAE working file; openMdb itself uses update access.
+    """Open a retained CAE working file; openMdb itself uses update access.
 
     Reading the original with shutil keeps its bytes/timestamp unchanged. This is
-    temporary kernel workspace, removed after saveAs/close, never a delivered backup.
+    kernel workspace, retained after saveAs/close as requested for inspection.
     Default workspace is alongside the scripts, not in an existing result directory.
     """
     from abaqus import openMdb
@@ -67,9 +56,10 @@ def open_working_mdb(source_cae, scratch_dir=None):
         if ((before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
                 or any(os.path.exists(path) for path in locks)):
             raise ValueError('Source CAE changed or became locked while staging: '+source_cae)
+        print('CAE working file retained: '+working, flush=True)
         return _WorkingModelDatabase(openMdb(pathName=working), directory)
     except BaseException:
-        shutil.rmtree(directory)
+        print('CAE working directory retained after error: '+directory, flush=True)
         raise
 
 STATUS_FILE = 'pipeline_status.json'

@@ -181,7 +181,9 @@ of a `NoneType` exception; no artificial LPF/capacity is filled in.
 only a later `saveAs` is requested. Step4, Step5, both P-M builders and legacy CAE
 metadata readers therefore open a temporary working CAE inside the code workspace
 through `abaqus_pipeline_contract.open_working_mdb`. The original is only read;
-the temporary file is removed after `saveAs`/close. It is not a delivered backup.
+the working CAE is retained in `cfs_cae_work_*` alongside the scripts, including
+after `saveAs`/close or a failed open. Its path is printed. No deletion is attempted
+while Abaqus or another process may hold the file; the final delivered CAE is retained too.
 Windows physical cores are discovered directly from native CPU topology, without
 requiring WMI permission; solver defaults remain all physical cores, all visible
 GPUs and 100% memory, with no capacity reservation.
