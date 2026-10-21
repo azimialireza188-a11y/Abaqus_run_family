@@ -110,6 +110,8 @@ def parse_arguments(argv=None):
     p.add_argument('--source-cae', required=True)
     p.add_argument('--output-dir', required=True)
     p.add_argument('--fy', type=float, required=True)
+    p.add_argument('--cufsm-report-dir',
+                   help='CUFSM report directory; builtup_4_pieces capacity references for plots only')
     p.add_argument('--load-case', choices=pipeline_contract.LOAD_CASES, default=None,
                    help='Assert the inherited Step4 loading; never converts its load case')
     p.add_argument('--steel-plate-fy', type=float,
@@ -120,6 +122,8 @@ def parse_arguments(argv=None):
     p.add_argument('--min-arc', type=float, default=1e-8)
     p.add_argument('--max-arc', type=float, default=.05)
     p.add_argument('--max-increments', type=int, default=5000)
+    p.add_argument('--riks-controls', choices=('default', 'robust'), default='robust',
+                   help='Bounded Newton line search and delayed divergence checks; equilibrium tolerances unchanged')
     p.add_argument('--riks-extrapolation', choices=('linear','none'), default='linear',
                    help='Riks predictor; linear keeps existing behavior')
     p.add_argument('--max-end-displacement-mm', type=float)
@@ -168,6 +172,12 @@ def parse_arguments(argv=None):
         p.error('--postpeak-stop-ratio must satisfy 0 < ratio < 1')
     args.source_cae = os.path.abspath(os.path.expanduser(args.source_cae))
     args.output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
+    args.report_reference=None
+    if args.cufsm_report_dir:
+        from abaqus_report_reference import read_reference
+        args.cufsm_report_dir=os.path.abspath(os.path.expanduser(args.cufsm_report_dir))
+        try:args.report_reference=read_reference(args.cufsm_report_dir,fy=args.fy)
+        except (OSError,ValueError) as error:p.error('--cufsm-report-dir: %s'%error)
     return args
 
 
@@ -678,6 +688,13 @@ def prepare_model(model, args, pm_template=False):
             source_contact=reference['shell_contact']),
         warning='Pilot Riks settings; no solve/convergence or physical mode classification validated. Do not remesh.')
     info['load_case'] = load_case
+    if getattr(args,'report_reference',None) is not None:
+        info['report_reference']=args.report_reference
+    else:
+        from abaqus_report_reference import step5_reference
+        calculated_reference=step5_reference(info)
+        if calculated_reference:
+            info['report_reference']=calculated_reference
     info['end_condition'] = dict(pipeline_contract.STEP5_END_CONDITION)
     info['section_for_PM'] = dict(
         area_mm2=end_area[0], squash_load_N=end_area[0]*args.fy,
@@ -817,11 +834,73 @@ def bending_end_loads(model, pieces, thickness, zmin, zmax, load_case, reference
         bending_axis_deg=load_case.get('neutral_axis_angle_deg'))
 
 
-def verify_input(path, bolts, bending=False):
+def riks_controls_profile(request='auto', settings=None):
+    """New inputs use bounded controls; auto-resume preserves the recorded policy."""
+    if request not in ('auto', 'default', 'robust'):
+        raise ValueError('Unknown Riks controls: '+str(request))
+    if settings is None:
+        return 'robust' if request == 'auto' else request
+    actual = settings.get('riks_controls', 'default')
+    if actual not in ('default', 'robust'):
+        raise ValueError('Unknown saved Riks controls: '+str(actual))
+    if request != 'auto' and request != actual:
+        raise ValueError('Saved Riks controls differ; use a fresh --pm-directory / Step5 directory. Existing results are preserved.')
+    return actual
+
+
+def riks_controls_keywords(profile):
+    if riks_controls_profile(profile) == 'default':
+        return ''
+    return ('*Controls, analysis=DISCONTINUOUS\n'
+            '*Controls, parameters=LINE SEARCH\n4, 1, 0.0001, 0.25, 0.1\n')
+
+
+def verify_riks_controls(text, profile='default'):
+    """Allow only the declared bounded controls, never altered accuracy controls."""
+    blocks = []
+    for block in re.split(r'(?=^\*[^*])', text.upper(), flags=re.M):
+        lines = [line.strip() for line in block.splitlines() if line.strip() and not line.startswith('**')]
+        if lines and re.match(r'^\*CONTROLS\b', lines[0]):
+            blocks.append(lines)
+    if profile == 'default':
+        if blocks:
+            raise RuntimeError('STEP5 solution controls differ from the reference defaults')
+        return
+    if riks_controls_profile(profile) != 'robust':
+        raise RuntimeError('Unsupported solution controls')
+    found = set()
+    for lines in blocks:
+        keyword = lines[0].replace(' ', '')
+        if keyword == '*CONTROLS,RESET' and not found:
+            if len(lines) != 1: raise RuntimeError('Unexpected control reset data')
+            continue
+        if keyword == '*CONTROLS,ANALYSIS=DISCONTINUOUS' and len(lines) == 1:
+            name = 'discontinuous'
+        elif keyword == '*CONTROLS,PARAMETERS=LINESEARCH' and len(lines) == 2:
+            defaults = [0., 1., .0001, .25, .1]
+            tokens = lines[1].split(',')
+            if any(value.strip() for value in tokens[5:]):
+                raise RuntimeError('Unexpected extra Newton line-search controls')
+            values = [float(value.strip()) if value.strip() else defaults[i]
+                      for i, value in enumerate(tokens[:5])]
+            values += defaults[len(values):]
+            if values != [4., 1., .0001, .25, .1]:
+                raise RuntimeError('Unexpected Newton line-search controls')
+            name = 'line_search'
+        else:
+            raise RuntimeError('STEP5 input changes undeclared solution/accuracy controls')
+        if name in found: raise RuntimeError('Duplicate STEP5 solution controls')
+        found.add(name)
+    if found != {'discontinuous', 'line_search'}:
+        raise RuntimeError('Declared robust Riks controls are missing from STEP5 input')
+
+
+def verify_input(path, bolts, bending=False, riks_controls='default'):
     with open(path) as stream:
         text = stream.read().upper()
-    if re.search(r'^\*(?:COUPLING|KINEMATIC|CONTACT CONTROLS|CONTROLS)\b', text, re.M):
+    if re.search(r'^\*(?:COUPLING|KINEMATIC|CONTACT CONTROLS)\b', text, re.M):
         raise RuntimeError('STEP5 input differs from the reference end/support and solution policy')
+    verify_riks_controls(text, riks_controls)
     if bending and not re.search(r'^\*CLOAD\b', text, re.M):
         raise RuntimeError('Bending STEP5 input has no *CLOAD end forces')
     for pattern in (r'\*STEP[^\n]*NLGEOM=YES', r'\*STATIC[^\n]*RIKS', r'\*PLASTIC',
@@ -929,10 +1008,15 @@ def write_job_input(database, name, info, args, user_subroutine):
     report('VERIFY INP', name)
     inject_urdfil_trigger(name+'.inp')
     verify_input(name+'.inp', len(info['bolts']),
-                 bending='reference_moment_Nmm' in info or 'pm_template' in info)
+                 bending='reference_moment_Nmm' in info or 'pm_template' in info,
+                 riks_controls=getattr(args, 'riks_controls', 'default'))
     info.update(job_name=name, input_sha256=pipeline_contract.file_sha256(name+'.inp'),
-                solution_controls=dict(analysis='Abaqus defaults',
+                solution_controls=dict(analysis=('bounded Newton / discontinuous' if
+                    getattr(args, 'riks_controls', 'default') == 'robust' else 'Abaqus defaults'),
                     equilibrium_tolerances='Abaqus defaults', stabilization=False))
+    if getattr(args, 'riks_controls', 'default') == 'robust':
+        info['solution_controls'].update(line_search_iterations=4, divergence_check_after=8,
+                                         convergence_rate_check_after=10, equilibrium_iteration_limit=16)
     return job
 
 
@@ -1037,7 +1121,7 @@ def build(args):
 
 
 def create_riks_step(model, assembly, args):
-    """Keep the original Riks procedure; optionally change only its initial predictor."""
+    """Preserve the Riks path and tolerances; improve bounded Newton correction."""
     from abaqusConstants import ON, OFF
     stop = args.max_end_displacement_mm
     options = dict(name='GMNIA', previous='Initial', nlgeom=ON,
@@ -1051,6 +1135,9 @@ def create_riks_step(model, assembly, args):
         options['extrapolation'] = NONE
     # totalArcLength scales the arc-length formulation; it is not an end condition.
     model.StaticRiksStep(**options)
+    if riks_controls_profile(getattr(args, 'riks_controls', 'default')) == 'robust':
+        model.steps['GMNIA'].control.setValues(
+            allowPropagation=OFF, discontinuous=ON, lineSearch=(4., 1., .0001, .25, .1))
 
 
 if __name__ == '__main__':

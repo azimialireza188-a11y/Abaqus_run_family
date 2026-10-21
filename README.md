@@ -1,5 +1,249 @@
 # Abaqus_run
 
+## Compare the independent models with and without plates
+
+The original `abaqus_family_pipeline.py` commands remain independent. Use only
+one `--load-case` in an original command: argparse keeps the last occurrence,
+so `--load-case compression --load-case bending` runs bending only.
+
+The new `abaqus_compare_pipeline.py` runs both existing repositories in separate
+Python processes, then collects their exact planned P-M folders on one comparison
+chart. It changes no geometry, load, connection, imperfection or capacity-selection
+formula. Shared settings are specified once. Plate geometry/Fy options go only to
+the plated repository; column-wall Fy is shared. Dataset pipelines execute
+sequentially. Within each nonlinear queue, `--parallel-jobs 2` runs independent
+jobs concurrently with a shared CPU/RAM budget and a single GPU-owning worker.
+
+CMD example for PERFECT models, the 0-degree bending axis and skip count 3:
+
+```bat
+cd /d "C:\Users\810200014.HAMI.001\Documents\Abaqus_run_family - Copy"
+py -3.14 "C:\Users\810200014.HAMI.001\Documents\Abaqus_run_family - Copy\abaqus_compare_pipeline.py" ^
+  --family-root "C:\Users\810200014.HAMI.001\Documents\CUFSM-Single\cfs_abaqus_family_imperfection\A4784_t2_qm1_0_0_0_R8_lipR20t_lipLen60_M80_L3600_gap10_nb19_end25-25_row15\New folder" ^
+  --output-root "D:\column-result\PM_compare_no_plates_with_plates" ^
+  --no-plates-repo "C:\Users\810200014.HAMI.001\Documents\Abaqus_run" ^
+  --plates-repo "C:\Users\810200014.HAMI.001\Documents\Abaqus_run_family - Copy" ^
+  --load-case bending ^
+  --bending-axis-deg 0 ^
+  --pm-only ^
+  --parallel-jobs 2 ^
+  --pm-axes "0" ^
+  --pm-angles "0,15,30,45,60,75,90" ^
+  --model-cases perfect ^
+  --mesh-mm 20 ^
+  --n-modes 250 ^
+  --n-vectors 500 ^
+  --max-iterations 1250 ^
+  --cpus auto ^
+  --buckle-output detailed ^
+  --nodal-precision full ^
+  --longitudinal-lines 4 ^
+  --longitudinal-line-min-spacing-mm 5 ^
+  --steel-column-plate-fy 240 ^
+  --steel-plate-fy 240 ^
+  --steel-plate-length 40 ^
+  --steel-plate-length-2 40 ^
+  --steel-plate-gap-mm 0 ^
+  --steel-plate-skip-count "3" ^
+  --local-mode 1 ^
+  --global-modes "1" ^
+  --resume
+```
+
+Outputs under the common root:
+
+```text
+no_plates/              existing no-plate pipeline layout and results
+with_plates/            existing plated pipeline layout and results
+diagram/PM_interaction.png
+diagram/PM_interaction.svg
+diagram/PM_interaction_points.csv
+comparison_manifest.json
+```
+
+`--pm-only` prepares the original geometry, required eigen-references and Step4,
+then builds/solves the P-M rays directly. It omits the separate nonlinear Step5
+bending/compression run and its response plots. A `_BEND000` preparation folder
+can still exist: its name describes the reference load case. The P-M rays retain
+their pure-compression and pure-bending endpoints. Removing `--load-case` alone
+does not request this mode; the comparison default remains bending at zero degrees.
+
+`--parallel-jobs` defaults to `1` for compatibility with existing runs; `auto`
+selects up to two workers and a positive integer requests that many. `--cpus`
+is the **total** physical-core budget shared among the workers. For example,
+12 cores and two jobs allocate 6 cores per job. Memory shares total 100%, no
+cores/RAM are reserved, and only one slot requests the available GPUs. Each solve
+uses private working/scratch files. ODB extraction, plots and common status writes
+remain serialized. Queues refuse a second manager on the same output directory.
+These settings take effect on a new queue launch; they do not reconfigure a live job.
+
+New nonlinear inputs use bounded Newton robustness controls: up to four line
+search iterations, and discontinuous-analysis checks (I0=8, IR=10). Accuracy
+tolerances, material laws, supports, minimum arc length, 5000-increment ceiling
+and the post-peak stop are unchanged. There is no automatic retry sweep.
+`--riks-controls auto` (pipeline default) preserves recorded controls for existing
+inputs; legacy inputs mean `default`. Editing source code never changes an
+existing failed input or causes an occupied job to be solved again.
+
+To try the revised controls after a failed comparison, keep the verified base
+stages and add these options to the original command with `--resume`:
+
+```bat
+  --riks-controls robust ^
+  --pm-directory "Step5_PM_ROBUST_V1" ^
+```
+
+Choose an unused folder name. This now selects a fresh nonlinear folder for HSS
+as well as both built-up variants; existing Step1-4/reference evidence is reused.
+Variant-specific `--plates-pm-directory` / `--no-plates-pm-directory` overrides
+must also name fresh folders or be removed. Existing FE results are preserved.
+The new nonlinear inputs must actually be solved to assess any improvement;
+convergence is not guaranteed, particularly at a perfect-model bifurcation.
+The original selection policy for other unfinished curves is unchanged. Missing
+points remain missing when their response has no accepted peak/event/ascending
+endpoint; `PM_analysis_audit.json` records the solver diagnostics and reason.
+
+Add the following options to include the report's closed HSS benchmark:
+
+Building demands can also be displayed on the common dimensional diagram:
+
+```bat
+  --demand-csv "C:\Users\810200014.HAMI.001\Documents\Abaqus_run_family - Copy\building_8story_demands.csv" ^
+```
+
+The supplied CSV transcribes the attached eight-storey building report dated
+October 14, 2026 (DOCX SHA256
+`ac89e28fb3c5ea39a7005f0ea32b3fd3423916dd389c8bd6b739622a067077b1`).
+Report tonne-force and tonne-force metres use 9.80665 kN/tf. It contains 56
+cases: gravity and earthquake demands for interior, perimeter and corner
+columns, including eight alternate axial cases. The small interior seismic
+moments follow the report's explicit instruction to use the gravity values.
+Approximation and unconfirmed simultaneity are retained in `notes`.
+
+CSV columns are `id,floor,column,load_case,P_kN,M_major_kNm,M_minor_kNm,notes`.
+Column roles are `interior|perimeter|corner`; cases are `gravity|seismic`.
+P is signed (compression positive). Moments are nonnegative component
+magnitudes in the report, with unknown values left blank. The report does not
+pair moments with its alternate tension/axial cases; these eight cases are
+listed in `PM_demand_points.csv` and explicitly omitted from P-M point plotting.
+No zero moment is invented. Report component axes remain unassigned to model
+axes: overlays are visual references, not a uniaxial or biaxial design check.
+No resultant moment, utilization ratio or pass/fail classification is generated.
+
+Column role determines demand colour, gravity/seismic uses square/triangle
+markers, minor-component projections use crosses, and small numbers identify
+storeys. Dimensional demand figures separate these groups into panels rather
+than overlaying every label on one main diagram. Demand data are separate from capacity
+CSV files and never change the FE inputs or solver settings. The option also
+works with `abaqus_pm_interaction.py --mode collect`; normalized comparisons
+require actual common Py/My scales and otherwise fail explicitly. Validate a
+new demand CSV before starting solves; use the same schema for later buildings.
+
+The collector writes the approved readable layouts automatically, without
+any new CLI option or extra Abaqus analyses:
+
+- `01_PM_models_readable.png/.svg/.pdf`: selected FE curves with a compact
+  legend and a table of P/M coordinates and selection status for each loading
+  ray. Filled markers indicate verified selections; open markers are provisional.
+- `02_PM_demands_readable.png/.svg/.pdf`: separate gravity/earthquake rows and
+  interior/perimeter/corner/component columns, generated with `--demand-csv`.
+  Each panel uses physical P/M coordinates and identifies storeys by number.
+  Unknown paired moments stay blank; no floor orientation is inferred.
+- `03_PM_path_checks.png/.svg/.pdf`: response-path diagnostics, generated only
+  when an apparent load drop nearly retraces the preceding ascending response.
+  Such observed peaks remain visible with status `R`, without capacity verification.
+- `PM_analysis_audit.json`: per-analysis solver outcome, selection, missing
+  points and response-path warnings, with summary counts.
+
+These files are saved in the same `diagram` output directory. The dimensional
+`PM_interaction.png/.svg/.pdf` and `PM_interaction_A*.png/.svg/.pdf` also use
+the readable model layout; demands have their own panels. Multiple bending
+axes receive separate files with `_A000`, `_A045`, etc. suffixes. Axis limits,
+table rows and labels are derived from the current datasets and analysis plan;
+there are no section-specific plot limits or assumed seven-point counts. The
+supplements are dimensional (kN/kN m), including when the ordinary plot uses
+`--normalized`. References are identified as report section benchmarks.
+Connecting provisional points does not verify an envelope; a dotted segment
+marks a missing planned interior ray. Omitted analyses are never filled in or
+treated as additional FE results. The response-path screen is a warning, not
+a bifurcation check or proof of collapse. Ordinary unfinished-curve selection
+(load drop, stiffness change or ascending endpoint) is unchanged. On `--resume`,
+valid existing CSVs are reassessed without resubmitting occupied jobs. CPU/GPU/memory and
+solver settings are unaffected.
+
+```bat
+  --include-hss ^
+  --hss-model-cases both ^
+```
+
+The HSS geometry is read from `summary.xlsx`, `section_properties_3 / box_same_A`
+(full-precision outer B/H and section properties), and `key_values` (thickness,
+member length and centreline corner radius). Family CSVs supply the shared E/nu;
+their t/L/E/nu must agree. Missing or ambiguous geometry fails preflight before
+any dataset is launched. No dimensions are guessed from screenshots or folder names.
+The HSS is a continuous, closed S4R shell without built-up bolts or intermediate
+plates, with the same end-DOF restraints and proportional P-M loading convention.
+Its output is under `hss/HSS_Axis*/Step5_PM_HSS`, added to the common diagram with
+its own dataset label/style. `--hss-model-cases perfect|imperfect|both` is independent
+of the built-up `--model-cases` selection and defaults to `both`.
+
+The imperfect HSS uses its **own** Local and Global compression-buckling reference
+models and classified eigenvectors; built-up modes are never transferred to it.
+The normal Local amplitude is 0.34t and the Global transverse amplitude is L/1000.
+These are prescribed specimen imperfections, not a search for the worst possible
+imperfection. CAE databases and the original solver INPs are retained. Native
+HSS solves still require verification by the user's subsequent Abaqus run.
+
+HSS noGUI argument parsing removes only the known CAE kernel options
+(`-cae`, `-noGUI`, `-tmpdir`, `-lmlog`), with or without the `--` separator;
+unknown user options still fail. CAE preservation writes `HSS_CAE_save.log`
+next to the requested database. A zero launcher exit alone is not success:
+the requested CAE must exist and be nonempty. Failure messages include the
+bounded log/replay tail. This fixes CAE argument errors before any HSS solve;
+existing matching INPs can be reused with the original `--resume` command.
+
+`--dry-run` prints the exact validated plan without creating outputs or running
+Abaqus. `--collect-only` redraws already available, matching results without
+running either model pipeline. `--resume` is passed to each original pipeline,
+which checks its own modes, cases, material, settings and provenance. To reuse
+independent older output roots, set `--no-plates-output-root` and
+`--plates-output-root`; `--no-plates-pm-directory` and `--plates-pm-directory`
+select their actual P-M folder names. Inputs must match the selected cases and
+settings; a both-case analysis is not silently reused as a perfect-only build.
+
+P-M runs already include the pure-P and pure-M rays. For separate primary axial
+and bending workflows as well, replace `--load-case bending` with
+`--load-cases "compression,bending"`. The comparison runner also accepts repeated
+`--load-case` options explicitly, unlike the original scripts. Curves remain
+separate for each source load case/family/plate configuration. Its default shared
+`--global-modes` is `1`; an explicit list is passed unchanged to both pipelines.
+`--model-cases imperfect` or `both` selects the other nonlinear cases.
+`--variants no-plates` or `plates` runs just one repository through this entrypoint.
+
+The comparison collector gives datasets distinct styles and explicit labels.
+Accepted provisional points are connected, including mixed verified/provisional
+series, while their hollow markers and selection-status labels are preserved.
+These connections are visual guides; they do not turn incomplete analyses into
+verified capacities. Two pure endpoints are labeled as an endpoint-only guide.
+Points from different datasets/cases/axes never form one connected curve.
+Persistent transitions into softening can qualify as provisional stiffness-change
+points under the existing statistical/persistence gates. They are not marked as
+verified peaks. The plot/selection version is updated so a later `--resume` or
+collection refresh can include supported points omitted by an older plot policy;
+editing the source code alone does not rewrite existing result files.
+
+The same plotting behavior is available independently using the family repository's
+collector. Example after defining `PM_RUN` to an existing P-M folder in CMD:
+
+```bat
+py -3.14 "C:\Users\810200014.HAMI.001\Documents\Abaqus_run_family - Copy\abaqus_pm_interaction.py" ^
+  --mode collect --roots "%PM_RUN%" --output-dir "%PM_RUN%\diagram" --fy 240
+```
+
+For a manual comparison, pass multiple `--roots` and one unique
+`--dataset-labels` value per root. This collector reads existing result files and
+writes the requested diagram outputs; it never submits a solver job.
+
 ## Sequential family CLI
 
 Run `D:\Abaqus_run\abaqus_family_pipeline.py` with normal Python (not Abaqus
@@ -8,8 +252,10 @@ CPU/output options, and `--local-mode` / `--global-modes`. `--help` lists them.
 The wrapper resides in `D:\Abaqus_run`; it does not edit the existing model scripts.
 All immediate family directories are checked before output creation and processed
 in numeric `family_N` order. Output is `OutputRoot/FamilyRoot.name/family_N` with
-sibling `family_N_REF_L` and `family_N_REF_G`. Existing destinations cause a refusal;
-partial runs are preserved and automatic resume is not implemented.
+sibling `family_N_REF_L` and `family_N_REF_G`. Use `--resume` for compression,
+bending and P-M: matching completed stages are reused after input/provenance and
+lock checks. Existing failed analyses are preserved; use a fresh Step5 directory
+or output root when an analysis cannot be safely reused.
 
 The global imperfection is one eigenvalue group of the solved REF_G: an explicit
 `--global-modes` list that is not one complete group (e.g. `1,2` in bending, where the
@@ -23,12 +269,12 @@ completed solve are regenerated, and an unfinished attempt is preserved in
 solve/classify L then G with stiffness required, build only the imperfection
 `LG_mp=-0.34t,0,L/1000` at global angle 0, then build Step5 and execute its generated
 70% queue. The next family starts only after queue outcomes and comparison output
-are checked. Step5 retains its PERFECT baseline; fy is fixed at 240 MPa, Riks arc
+are checked. Step5 retains its PERFECT baseline; column fy defaults to 240 MPa, Riks arc
 settings at 0.01/1e-8/0.05 and max increments at 5000. Selected mode numbers must
 be within 1..20 and are passed to every family; this does not select modes from
 engineering criteria automatically. `--cpus` is forwarded to every solver stage;
-the existing stages handle local capacity and GPU detection. No steel plates are
-added by this workflow. Both reference solves and Step5 analyses can take a long
+the existing stages handle local capacity and GPU detection. Steel plates are
+optional through the plate arguments. Both reference solves and Step5 analyses can take a long
 time when the user executes this CLI.
 
 ## Family repository: transverse steel plates
@@ -921,3 +1167,241 @@ queue or analyses. Stopped/unverified responses retain their provisional status.
 P-M collection distinguishes both nonlinear and elastic datasets, deduplicates
 overlapping search roots, and normalizes elastic results against their own
 section reference. A common plastic reference is omitted when sections differ.
+
+### Optional legacy CUFSM built-up strength lines and resume
+
+For an explicit legacy override, add `--cufsm-report-dir "<CUFSM report directory>"`. By default, A/S/Z are calculated from model geometry. The
+directory must contain `summary.xlsx` with the `section_properties_3` worksheet.
+The reader locates columns by name and uses **only `builtup_4_pieces`**, never
+`single_piece`, flattened alternatives or the equivalent box. It validates
+units, positive finite properties and consistency of the report's yield stress.
+No Excel installation or spreadsheet package is needed.
+
+The exact built-up area A and moduli S/Z are multiplied by the current column
+`--steel-column-plate-fy` (standalone Step5/P-M: `--fy`), independently of
+`--steel-plate-fy`. Compression plots show AsFy in kN. Moment-rotation plots show
+SFy and ZFy in kN m. P-M diagrams use M horizontally and P vertically, with
+vertical SFy/ZFy and horizontal AsFy lines. The report's x/z axes correspond to
+neutral-axis angles 0/90 degrees. For other angles the x benchmark is explicitly
+labelled `report built-up x`; it is not an exact capacity for that requested angle.
+The solver's loads, LPF conversion, mesh-based strength ratios and P-M sampling
+remain defined by their original model metadata.
+
+The reader records the workbook checksum and the current yield stress in new
+Step5 sidecars. The same directory option works on the standalone Step5 builder,
+queue, response extractor and P-M collector. Standalone P-M collection uses the
+explicit `--fy`, or derives a unique
+current column Fy from the collected models; unavailable/mixed Fy requires
+`--fy` explicitly. During family resume the supplied directory
+overlays plotting metadata in memory; existing input/metadata sidecars are not
+rewritten. Family, individual and combined comparisons use saved curves without
+a new solve or ODB extraction. Changing the report makes the P-M diagram stale
+but leaves the verified physical request valid, so only collection/plotting is
+repeated.
+
+If Step5 generation stopped before delivering its final CAE/queue file, use
+`--resume --step5-directory Step5_retry` to build in a fresh folder. A verified
+Step4 checkpoint permits reuse even when the earlier Step5 delivery is partial.
+Changed source/settings, running locks and incompatible solver artifacts still
+cause a refusal. Completed analyses are reused; `--resume` is not an Abaqus
+restart of an arbitrary interrupted increment. Working CAE files are retained.
+
+### P-M envelopes and axial-only ray requests
+
+`--pm-axes` selects bending directions; `--pm-angles` selects load proportions.
+`--pm-angles "0"` requests pure compression only, regardless of how many bending
+axes were selected. A member interaction diagram requires compression, bending
+and combined-load samples, for example `--pm-angles "0,15,30,45,60,75,90"`.
+The program warns before launch when this envelope is incompletely sampled.
+
+The diagram keeps M horizontal and P vertical, marks section-reference
+intercepts A/B and puts the legend below the data. All section-reference axes
+are plotted even when the only GMNIA result is a pure-P point. The dashed curve
+is the computed rigid-plastic **steel built-up cross-section** envelope;
+case-specific segments guide the verified GMNIA member samples. Incomplete/provisional points
+retain separate markers and do not establish a verified capacity envelope.
+An axial-only set is explicitly labelled as an unsampled member P-M envelope.
+The curve is determined by the actual section/results; the nonmonotonic shape
+of a steel-concrete composite-section illustration is not imposed on steel-only
+built-up data. SFy/ZFy/AsFy benchmarks retain their reported built-up meanings.
+
+Outputs are `<family>/imperfection/<PM directory>/diagram/PM_interaction.png`
+and `.svg`, with individual `_A<axis>` figures. The family command prints the
+PNG path on completion and on reuse. Plot-version receipts make future style
+changes refresh diagrams without resubmitting completed analyses.
+
+If the existing folder was generated with `--pm-angles "0"`, changing to the
+full ray list in the same folder correctly fails its request/provenance check.
+Add `--pm-directory Step5_PM_FY240_LG_REF1_FULL --resume` to use a fresh P-M
+destination while reusing verified original/reference/Step4/primary Step5
+stages. The option accepts a single folder name, never a nested/absolute path.
+Existing P-M inputs and results remain in their original folder.
+
+### PERFECT and imperfect nonlinear model selection
+
+The family entry point accepts `--model-cases both|perfect|imperfect`:
+
+| Value | Step5 and P-M nonlinear models |
+| --- | --- |
+| `both` (default) | PERFECT and LG_mp |
+| `perfect` | PERFECT only |
+| `imperfect` | LG_mp only, using the existing LG imperfection definition |
+
+The choice is passed to both builders through their existing `--models`
+interface and limits generated nonlinear inputs and submitted jobs. Shared
+original/reference/Step4 preparation remains the existing workflow; its CAE
+may contain additional preparation models. The delivered Step5 CAE and P-M
+jobs contain only the requested nonlinear cases.
+
+Default nonlinear directories and family comparison figures receive
+`_PERFECT_ONLY` or `_IMPERFECT_ONLY` for a single-case request; `both` retains
+all previous names and resume compatibility. Existing `--step5-directory` and
+`--pm-directory` overrides are honored. Use a fresh explicit name when changing
+the selected cases in a previously occupied destination, or omit these overrides
+to use the automatic case-specific names. Resume validates the selected Step5
+input set and P-M request/manifest before submitting anything. No old inputs,
+results or CAEs are deleted to implement model selection.
+
+For a family command, add `--model-cases perfect` or `--model-cases imperfect`.
+For standalone Step5 or P-M GMNIA commands, the equivalent existing arguments
+are `--models PERFECT` and `--models STEP4_LG_mp` respectively.
+
+Single-dataset P-M diagrams identify PERFECT with blue circles and a solid line;
+imperfect cases use orange squares and a dashed line. Comparisons use distinct
+dataset colors. This applies
+to dimensional, normalized and multi-panel plots, including older datasets whose
+case must be recovered from the model/job name. Different imperfection names
+retain separate labelled curves. Provisional points remain hollow and are connected
+within their own source/case/dataset;
+their status remains explicit under the shared `response-v3` rules below. Case style
+does not certify a failed analysis or merge datasets. The updated plot version
+allows diagrams to be regenerated from saved curves without new solves.
+
+### Shared terminal P-M selection and connections
+
+Response-v3 applies to no-plate, plated and HSS jobs, independently or in the
+comparison. Existing load-drop/stiffness-change events and verified-peak rules
+are retained. An unfinished rising response still uses its ascending endpoint.
+If none of those rules selects a point from a terminal response, its attained
+maximum is retained as `UNVERIFIED_OBSERVED_MAXIMUM`, with synchronized P/M
+from that one converged frame and `capacity_verified=false`.
+
+Every displayed point participates in its own specimen/case line, including
+provisional points and path-review results. Lines are comparison guides, not
+verified resistance envelopes. Hollow markers remain provisional; attained
+maxima use crosses and `O` in the dimensional comparison table. Truly missing
+rays are not fabricated. Pure bending/compression stay on their actual axes.
+
+`PM_interaction_points.csv` includes those provisional terminal selections.
+`PM_observed_points.csv` remains available for separate display-only observations
+when no selection can be formed (for example, no measurable response path).
+`PM_analysis_audit.json` retains solver-error and path-review counts regardless
+of whether a point is drawn. This rule applies to all specimen types. Locked
+jobs and stale/inconsistent curves remain rejected. Collection reads saved
+results without ODB extraction, repeated solves or automatic retries.
+
+The new plot version refreshes diagrams on subsequent collection/resume. A
+comparison still running analyses will publish its combined diagram only after
+its planned datasets have finished processing; an older diagram is not a live
+view of the current solve queue.
+
+### Per-job axial and bending response, with ODB frame labels
+
+Every P-M collection also writes one two-panel image per validated nonlinear
+job, for no-plate, plated and HSS datasets and every requested model case/ray.
+The left panel is P (kN) versus axial shortening (mm); the right panel is M
+(kN m) versus the work-conjugate total end rotation (mrad). Both use the same
+saved, synchronized frames from `<job>_pm_response.csv`, including failed or
+provisional responses, without reopening an ODB or solving again.
+
+Files are `<diagram>/response_curves/<dataset-label>_<identity>/<job>_axial_bending_response.png`
+and `.svg`. Dataset identities prevent identically named jobs from different
+specimens overwriting each other in the combined output. The comparison command
+creates these under its common `<output-root>/diagram`; independent family
+collection creates them under that family's P-M `diagram`.
+
+Each horizontal tick has two rows: its physical coordinate and the exact `F`
+index of the marked ODB sample. `F28` means `odb.steps['GMNIA'].frames[28]`;
+it is zero-based and does not mean increment number, LPF or step time. Sparse
+labels cover the physical response even when many increments cluster near a
+limit point. Reversed/duplicate coordinates are retained in solver order;
+there is no fictitious invertible displacement-to-frame scale. The red diamond
+marks the selected P-M frame and its verification state stays explicit.
+The original CSV maps **all** frames to P, M, shortening and rotation.
+
+`PM_model_response_plots.json` maps each model to its source CSV, images,
+selected frame and the labelled frame samples. A content signature reuses
+unchanged PNG/SVG files. Changed data/selection or a missing image triggers a
+replot, without solver submission or ODB extraction. Plot receipts include the
+paired images so `--resume` refreshes missing/new outputs from saved curves.
+Historic point-only CSV imports lacking response histories cannot produce these
+panels; no history or frame numbers are fabricated for them.
+
+Each job also receives `<job>_axial_bending_response.xlsx` beside its PNG/SVG.
+`Axial` contains all original frames, shortening (mm), axial force (kN) and LPF;
+`Bending` contains all frames, end rotation (mrad), moment (kN m) and LPF.
+Cells are numeric, frames remain in solver order, and headers are frozen and
+filterable. `Metadata` records model/case, axes/ray, source CSV/ODB, solver
+outcome and selected-point verification. Stopped/provisional jobs retain their
+actual status; exporting a workbook does not certify their capacity.
+Excel files need no additional installed Python package. Their version/signature
+is cached separately: a missing or interrupted workbook is recreated from CSV
+without rerendering valid images, extracting an ODB, or resubmitting an analysis.
+
+For a controlled alternative numerical predictor, `--riks-extrapolation none`
+is forwarded to all three builders. CAE and HSS write `EXTRAPOLATION=NO`.
+Use a fresh `--pm-directory` when changing it; an occupied input remains
+immutable. HSS can reuse its unchanged base mesh/reference models across such
+nonlinear folders. The default remains `linear`; disabling extrapolation is an
+optional experiment, not a demonstrated cure for a perfect-model bifurcation
+or the 75/90-degree failures. No iteration limits, accuracy tolerances, geometry,
+imperfections or automatic retry counts are changed by this option.
+
+
+### Report-free section properties and HSS comparison
+
+`--cufsm-report-dir` is optional. Omit that entire argument to calculate the
+section references inside this repository. `--family-root` still supplies the
+original geometry CSV files; no Excel workbook, MAT file or report folder is
+needed. An explicitly supplied report remains a legacy override.
+
+The gross built-up A, centroid and inertia use all four pieces of
+`builtup_segments.csv`, with their actual thickness. S = I/(c + t/2) uses the gross outer-fibre
+benchmark, matching the former CUFSM report. The shell loading and mesh-based
+normalization keep their original centre-line definition. Z uses the equal-area
+plastic neutral axis. Each requested bending angle, including 45 degrees, is
+integrated directly. AsFy, SFy and ZFy use the current column yield stress, not
+the auxiliary plate yield stress. Transverse connecting plates are excluded
+from these prismatic column section benchmarks.
+
+References are embedded in new Step5 metadata. For old metadata the collector
+can calculate them from the bound `pipeline_status.json` geometry snapshot,
+checking its saved SHA-256 when present, without opening the old workbook.
+This affects plotted benchmarks only; solver inputs, response selection,
+normalization and provisional/verified status keep their existing definitions.
+Different family geometries retain separate references; a common benchmark is
+omitted when the collected geometries differ.
+
+For `abaqus_compare_pipeline.py --include-hss`, HSS geometry also needs no
+report. The equal-area square uses the member CSV's nominal `A0_mm2` (or the
+integrated four-piece area when A0 is absent), actual t, member length, E and nu.
+The centre-line corner radius R comes from explicit member bend metadata or
+its structured `tag` field (`R2p5` means R/t = 2.5). Its outside side length is
+`B = A0/(4*t) + (2 - pi/2)*R + t`, preserving the existing report-generated
+geometry. No product thickness reduction is inferred. HSS A/S/Z are integrated
+through the rounded finite wall; the shell loading continues to use its actual
+meshed chord geometry. The small exact-arc versus chord-area difference is
+accounted for explicitly.
+
+If radius metadata is absent, supply `--hss-radius-mm VALUE` (centre-line mm);
+the program rejects an ambiguous radius instead of guessing. The override is
+also accepted by `abaqus_hss_pipeline.py`. Families with differing HSS
+geometry/material cannot silently share one HSS benchmark. Perfect and
+imperfect HSS case options retain their existing behavior.
+
+To use the comparison command without reports, remove only the complete
+`--cufsm-report-dir "..."` line; retain the other model/solver options.
+`--resume` accepts identical existing HSS geometry/material and preserves its
+saved input provenance, without reopening its workbook. Changed physical
+geometry/material still requires a new output root. `--dry-run` performs
+read-only validation without building or solving any model.

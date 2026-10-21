@@ -1,0 +1,57 @@
+﻿id,floor,column,load_case,P_kN,M_major_kNm,M_minor_kNm,notes
+G-I-1,1,interior,gravity,1804.4236,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-1,1,perimeter,gravity,902.2118,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-1,1,corner,gravity,451.1059,29.41995,29.41995,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+G-I-2,2,interior,gravity,1578.87065,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-2,2,perimeter,gravity,794.33865,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-2,2,corner,gravity,392.266,29.41995,29.41995,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+G-I-3,3,interior,gravity,1353.3177,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-3,3,perimeter,gravity,676.65885,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-3,3,corner,gravity,343.23275,29.41995,29.41995,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+G-I-4,4,interior,gravity,1127.76475,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-4,4,perimeter,gravity,568.7857,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-4,4,corner,gravity,284.39285,29.41995,29.41995,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+G-I-5,5,interior,gravity,902.2118,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-5,5,perimeter,gravity,451.1059,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-5,5,corner,gravity,225.55295,29.41995,29.41995,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+G-I-6,6,interior,gravity,676.65885,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-6,6,perimeter,gravity,343.23275,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-6,6,corner,gravity,166.71305,29.41995,29.41995,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+G-I-7,7,interior,gravity,451.1059,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-7,7,perimeter,gravity,225.55295,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-7,7,corner,gravity,117.6798,29.41995,29.41995,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+G-I-8,8,interior,gravity,225.55295,14.709975,,Approximate report demand; orientation unassigned; small approximate moment
+G-P-8,8,perimeter,gravity,117.6798,9.80665,,Approximate report demand; orientation unassigned; small approximate moment
+G-C-8,8,corner,gravity,58.8399,41.18793,41.18793,"Approximate report demand; orientation unassigned; biaxial, equal component magnitudes"
+E-I-1,1,interior,seismic,1363.12435,9.80665,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-I-2,2,interior,seismic,1186.60465,9.80665,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-I-3,3,interior,seismic,1019.8916,9.80665,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-I-4,4,interior,seismic,843.3719,9.80665,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-I-5,5,interior,seismic,676.65885,9.80665,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-I-6,6,interior,seismic,500.13915,9.80665,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-I-7,7,interior,seismic,333.4261,9.80665,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-I-8,8,interior,seismic,156.9064,14.709975,,P from seismic prose; approximate M stated as in gravity table; orientation unassigned
+E-P-1,1,perimeter,seismic,804.1453,500.13915,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-P-2,2,perimeter,seismic,696.27215,411.8793,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-P-3,3,perimeter,seismic,588.399,392.266,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-P-4,4,perimeter,seismic,480.52585,362.84605,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-P-5,5,perimeter,seismic,372.6527,318.716125,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-P-6,6,perimeter,seismic,274.5862,264.77955,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-P-7,7,perimeter,seismic,176.5197,196.133,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-P-8,8,perimeter,seismic,78.4532,107.87315,,Report Pmax and M maxima; simultaneity not confirmed; approximate portal estimate; orientation unassigned
+E-C-C1,1,corner,seismic,1470.9975,264.77955,93.163175,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A1,1,corner,seismic,-912.01845,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"
+E-C-C2,2,corner,seismic,1225.83125,215.7463,78.4532,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A2,2,corner,seismic,-735.49875,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"
+E-C-C3,3,corner,seismic,980.665,210.842975,78.4532,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A3,3,corner,seismic,-558.97905,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"
+E-C-C4,4,corner,seismic,745.3054,196.133,73.549875,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A4,4,corner,seismic,-392.266,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"
+E-C-C5,5,corner,seismic,529.5591,176.5197,63.743225,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A5,5,corner,seismic,-254.9729,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"
+E-C-C6,6,corner,seismic,343.23275,147.09975,58.8399,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A6,6,corner,seismic,-127.48645,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"
+E-C-C7,7,corner,seismic,186.32635,112.776475,49.03325,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A7,7,corner,seismic,-49.03325,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"
+E-C-C8,8,corner,seismic,68.64655,73.549875,39.2266,Report compression Pmax and biaxial M components; simultaneity/signs unconfirmed; orientation unassigned
+E-C-A8,8,corner,seismic,1.96133,,,"Alternate axial case 0.9D-E; paired moments not specified, NOT assumed zero; floor 8 is compression"

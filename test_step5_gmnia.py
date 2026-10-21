@@ -9,6 +9,41 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(
 import abaqus_step5_gmnia as step5
 
 
+class RiksControlTests(unittest.TestCase):
+    def test_auto_resume_keeps_saved_controls_and_explicit_changes_need_new_inputs(self):
+        self.assertEqual(step5.riks_controls_profile('auto'), 'robust')
+        self.assertEqual(step5.riks_controls_profile('auto', {}), 'default')
+        self.assertEqual(step5.riks_controls_profile('auto', {'riks_controls':'robust'}), 'robust')
+        with self.assertRaisesRegex(ValueError, 'fresh'):
+            step5.riks_controls_profile('robust', {})
+
+    def test_native_blank_defaults_are_accepted_but_accuracy_changes_are_refused(self):
+        text = ('*Step, name=GMNIA\n*Controls, reset\n*Controls, analysis=discontinuous\n'
+                '*Controls, parameters=line search\n4, , , , \n*End Step\n')
+        step5.verify_riks_controls(text, 'robust')
+        with self.assertRaises(RuntimeError):
+            step5.verify_riks_controls(text.replace('4, , , , ', '4, 2, , , '), 'robust')
+        with self.assertRaises(RuntimeError):
+            step5.verify_riks_controls(text.replace('*End Step', '*Controls, parameters=field\n0.1\n*End Step'), 'robust')
+
+    def test_robust_newton_controls_keep_arc_and_iteration_limits(self):
+        from types import SimpleNamespace as NS
+        from unittest import mock
+        captured, control = {}, {}
+        def create(**kwargs):
+            captured.update(kwargs)
+            model.steps['GMNIA'] = NS(control=NS(setValues=lambda **kw: control.update(kw)))
+        model = NS(StaticRiksStep=create, steps={})
+        args = NS(max_end_displacement_mm=None, max_increments=5000, initial_arc=.01,
+                  min_arc=1e-8, max_arc=.05, riks_extrapolation='linear', riks_controls='robust')
+        with mock.patch.dict('sys.modules', {'abaqusConstants': NS(ON=True, OFF=False)}):
+            step5.create_riks_step(model, NS(), args)
+        self.assertTrue(control.get('discontinuous'))
+        self.assertEqual(control['lineSearch'], (4., 1., .0001, .25, .1))
+        self.assertEqual((captured['minArcInc'], captured['maxNumInc']), (1e-8, 5000))
+        self.assertFalse(any(key.endswith('Field') for key in control))
+
+
 class SteelPlateTests(unittest.TestCase):
     def test_plate_yield_is_required_and_independent_of_member_curve(self):
         from types import SimpleNamespace as NS
@@ -141,6 +176,16 @@ class _FakeModel(object):
 
 
 class Step5Tests(unittest.TestCase):
+    def test_report_parser_uses_column_fy_and_resolves_directory(self):
+        from unittest import mock
+        import abaqus_report_reference as reports
+        expected=dict(group='builtup_4_pieces',AsFy_kN=100.)
+        with mock.patch.object(reports,'read_reference',return_value=expected) as reader:
+            args=step5.parse_arguments(['--source-cae','source.cae','--output-dir','out',
+                '--fy','350','--steel-plate-fy','240','--cufsm-report-dir','report'])
+        self.assertEqual(args.report_reference,expected)
+        reader.assert_called_once_with(os.path.abspath('report'),fy=350.)
+
     def test_each_verified_case_is_delivered_before_next_case_is_prepared(self):
         import json, tempfile
         for method in ('monitor', 'urdfil'):
@@ -244,6 +289,7 @@ class Step5Tests(unittest.TestCase):
             model.Coupling = mock.Mock()
             model.DisplacementBC = mock.Mock()
             args = step5.parse_arguments(['--source-cae', 'source.cae', '--output-dir', 'out', '--fy', '240'])
+            args.report_reference=dict(group='builtup_4_pieces',AsFy_kN=1234.)
             args.max_end_displacement_mm = stop
             constants = NS(ON=True, OFF=False, UNIFORM='UNIFORM', GENERAL='GENERAL', KINEMATIC='KINEMATIC',
                            WHOLE_SURFACE='WHOLE_SURFACE', SET='SET', UNSET='UNSET')
@@ -251,6 +297,7 @@ class Step5Tests(unittest.TestCase):
                     mock.patch.object(step5, 'replace_bolts', return_value={}), \
                     contextlib.redirect_stdout(io.StringIO()):
                 info = step5.prepare_model(model, args, pm_template=pm_template)
+            self.assertEqual(info['report_reference'],args.report_reference)
             # Reference procedure: keep the inherited nodal supports and free end warping.
             for name, bc in model.boundaryConditions.items():
                 bc.setValues.assert_not_called()

@@ -911,16 +911,21 @@ class WorkflowAlignmentTests(unittest.TestCase):
 
 
     @contextlib.contextmanager
-    def completed_family(self,load_case='compression',angle=0.,column_fy=240.):
+    def completed_family(self,load_case='compression',angle=0.,column_fy=240.,model_cases='both'):
         from pathlib import Path
         import abaqus_family_pipeline as pipeline
         with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as d:
             root=Path(d)
             source=root/'inputs'/'section'/'family_1';source.mkdir(parents=True)
             for name in pipeline.INPUT_FILES:(source/name).write_text('input')
+            # Plot references now use actual geometry even in orchestration tests.
+            (source/'builtup_segments.csv').write_text(
+                '1,-10,10,10,10,2\n2,-10,-10,-10,10,2\n3,10,-10,-10,-10,2\n4,10,10,10,-10,2\n')
+            (source/'builtup_member.csv').write_text(
+                'L_mm,t_mm,E_MPa,nu,fy_MPa\n3600,2,200000,0.3,240\n')
             args=pipeline.parse_arguments(['--family-root',str(source.parent),'--output-root',str(root/'out'),
                 '--repo',os.path.dirname(__file__),'--resume','--load-case',load_case,'--bending-axis-deg',str(angle),
-                '--steel-column-plate-fy',str(column_fy)])
+                '--steel-column-plate-fy',str(column_fy),'--model-cases',model_cases])
             run=args.output_root/source.parent.name/pipeline.family_run_name(args,source);run.mkdir(parents=True)
             state=dict(status='BUILT',settings=dict(vars(args),builtup_dir=str(source)),
                        source_inputs=dict(thickness_mm=2.),build=dict(job_name='BASE',length_mm=3600.))
@@ -986,6 +991,115 @@ class WorkflowAlignmentTests(unittest.TestCase):
             self.assertTrue(target.is_file())
             self.assertIn('family_1 LG_mp',target.read_text())
             self.assertEqual(before,{p:p.read_bytes() for p in before})
+
+    def test_single_model_family_resume_plots_only_selected_case_without_solver(self):
+        for selection,case in [('perfect','PERFECT'),('imperfect','LG_mp')]:
+            with self.subTest(selection=selection),self.completed_family(model_cases=selection) as (p,args,source,run,output):
+                self.assertEqual({path.stem for path in output.glob('*.inp')},{'STEP5_'+case+'_FY240'})
+                before={path:path.read_bytes() for path in output.iterdir() if path.is_file()}
+                with mock.patch.object(p.shutil,'which',return_value=None):
+                    p.run_pipeline(args,runner=mock.Mock(side_effect=AssertionError('no solve or extraction')))
+                svg=run.parent/('STEP5_family_force_displacement_'+selection.upper()+'_ONLY.svg')
+                self.assertIn('family_1 '+case,svg.read_text())
+                other='LG_mp' if case=='PERFECT' else 'PERFECT'
+                self.assertNotIn('family_1 '+other,svg.read_text())
+                self.assertEqual(before,{path:path.read_bytes() for path in before})
+
+    def test_selected_cases_reach_both_step5_and_pm_builders(self):
+        for selection,models in [('perfect',['PERFECT']),('imperfect',['STEP4_LG_mp'])]:
+            with self.subTest(selection=selection),self.completed_family(model_cases=selection) as (p,args,source,run,output):
+                calls=[]
+                def capture(command,cwd,label):
+                    calls.append(command);raise RuntimeError('captured selected models')
+                with mock.patch.object(p,'preflight',return_value=[(source,run,dict(step4=True))]):
+                    with self.assertRaisesRegex(RuntimeError,'captured selected models'):
+                        p.run_pipeline(args,runner=capture,abaqus='fake')
+                command=calls.pop()
+                first=command.index('--models')+1
+                self.assertEqual(command[first:first+len(models)],models)
+                args.pm_interaction=True
+                with self.assertRaisesRegex(RuntimeError,'captured selected models'):
+                    p.run_family_pm(args,source,run,'fake',capture,'test')
+                command=calls.pop()
+                first=command.index('--models')+1
+                self.assertEqual(command[first:command.index('--fy')],models)
+
+    def test_report_benchmarks_on_resumed_compression_and_bending_do_not_launch_analyses(self):
+        reference=dict(AsFy_kN=120.,axes={
+            'x':dict(axis_deg=0.,SFy_kNm=35.,ZFy_kNm=50.),
+            'z':dict(axis_deg=90.,SFy_kNm=45.,ZFy_kNm=60.)})
+        for kind,labels in [('compression',['AsFy']),('bending',['SFy','ZFy'])]:
+            with self.subTest(kind=kind),self.completed_family(load_case=kind) as (p,args,source,run,output):
+                args.report_reference=reference
+                before={path:path.read_bytes() for path in output.iterdir() if path.is_file()}
+                with mock.patch.object(p.shutil,'which',return_value=None):
+                    p.run_pipeline(args,runner=mock.Mock(side_effect=AssertionError('must not launch')))
+                stem='moment_rotation_BEND000' if kind=='bending' else 'force_displacement'
+                svg=(run.parent/('STEP5_family_'+stem+'.svg')).read_text()
+                for label in labels:self.assertIn(label,svg)
+                response='_moment_rotation' if kind=='bending' else '_force_displacement'
+                for name in p.expected_jobs(args):
+                    for label in labels:self.assertIn(label,(output/(name+response+'.svg')).read_text())
+                combined='STEP5_all'+response+'_combined.svg'
+                for label in labels:self.assertIn(label,(output/combined).read_text())
+                self.assertEqual(before,{path:path.read_bytes() for path in before})
+
+    def test_report_directory_reaches_step5_build_without_changing_column_fy(self):
+        with self.completed_family() as (p,args,source,run,output):
+            args.cufsm_report_dir=str(source/'report');calls=[]
+            def capture(command,cwd,label):
+                calls.append(command);raise RuntimeError('captured report build')
+            with mock.patch.object(p,'preflight',return_value=[(source,run,{'step4':True})]):
+                with self.assertRaisesRegex(RuntimeError,'captured report build'):
+                    p.run_pipeline(args,runner=capture,abaqus='fake')
+            command=calls[0]
+            self.assertEqual(command[command.index('--cufsm-report-dir')+1],args.cufsm_report_dir)
+            self.assertEqual(float(command[command.index('--fy')+1]),240.)
+
+    def test_fresh_step5_destination_resumes_verified_step4_after_partial_build(self):
+        with self.completed_family() as (p,args,source,run,output):
+            receipt=p.step4_receipt(args,source,run)
+            (output.parent/p.STEP4_RECEIPT).write_text(json.dumps(receipt))
+            (output/'Step5_GMNIA_FY240.cae').unlink()  # interrupted input generation, no final delivery
+            before={path:path.read_bytes() for path in output.iterdir() if path.is_file()}
+            args.step5_directory='Step5_retry'
+            progress=p.preflight(args)[0][2]
+            self.assertTrue(progress['step4'])
+            self.assertFalse(progress['step5'])
+            self.assertFalse(progress['completed'])
+            self.assertEqual(before,{path:path.read_bytes() for path in before})
+
+    def test_fresh_robust_destination_reuses_legacy_step4_but_not_old_solution_controls(self):
+        with self.completed_family() as (p,args,source,run,output):
+            before={path:path.read_bytes() for path in output.iterdir() if path.is_file()}
+            args.riks_controls='robust'
+            with self.assertRaisesRegex(ValueError, 'Riks controls differ'):
+                p.preflight(args)
+            args.step5_directory='Step5_robust'
+            progress=p.preflight(args)[0][2]
+            self.assertTrue(progress['step4'])
+            self.assertFalse(progress['completed'])
+            args.pm_only=True
+            self.assertTrue(p.preflight(args)[0][2]['step4'])
+            self.assertEqual(before,{path:path.read_bytes() for path in before})
+
+    def test_pm_graph_fingerprint_changes_only_when_report_benchmarks_change(self):
+        from pathlib import Path
+        import abaqus_family_pipeline as p
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as directory:
+            output=Path(directory);diagram=output/'diagram';diagram.mkdir()
+            (output/'STEP5_PM_points.csv').write_text('solved points')
+            (diagram/'PM_interaction_points.csv').write_text('points')
+            (diagram/'PM_interaction.svg').write_text('diagram')
+            record=dict(plot_source_sha256=p.file_sha256(output/'STEP5_PM_points.csv'),
+                        plot_files=['PM_interaction.svg'],plot_version=__import__('abaqus_pm_interaction').PLOT_VERSION)
+            reference=dict(source_sha256='report1',fy_MPa=240.,AsFy_kN=100.,axes={})
+            self.assertTrue(p.pm_plot_current(output,record))
+            self.assertFalse(p.pm_plot_current(output,dict(record,plot_version='legacy')))
+            self.assertFalse(p.pm_plot_current(output,record,reference))
+            record['plot_reference_sha256']=p.report_plot_signature(reference)
+            self.assertTrue(p.pm_plot_current(output,record,reference))
+            self.assertFalse(p.pm_plot_current(output,record,dict(reference,fy_MPa=350.)))
 
 
     def test_resume_rejects_changed_selected_modes_before_running_anything(self):
@@ -1236,6 +1350,28 @@ class SkipSweepTests(unittest.TestCase):
                 pipeline.run_family_pm(args,source,run,None,runner,'test',state=state)
                 self.assertEqual(len(calls),1)
                 self.assertEqual(calls[0][calls[0].index('--mode')+1],'collect')
+                # A new built-up report affects graphs only, without changing the
+                # physical P-M request or resubmitting any solved ray.
+                args.cufsm_report_dir=str(source/'report')
+                args.report_reference=dict(group='builtup_4_pieces',fy_MPa=350.,AsFy_kN=180.)
+                state=pipeline.check_pm_resume(args,source,run)
+                self.assertTrue(state['queue_completed']);self.assertFalse(state['completed'])
+                calls.clear()
+                before={path:path.read_bytes() for path in output.glob('PM_*') if path.is_file()}
+                pipeline.run_family_pm(args,source,run,None,runner,'test',state=state)
+                self.assertEqual(len(calls),1)
+                command=calls[0]
+                self.assertEqual(command[command.index('--mode')+1],'collect')
+                self.assertEqual(command[command.index('--cufsm-report-dir')+1],args.cufsm_report_dir)
+                self.assertEqual(before,{path:path.read_bytes() for path in before})
+                self.assertTrue(pipeline.check_pm_resume(args,source,run)['completed'])
+                args.model_cases='perfect'
+                self.assertIsNone(pipeline.check_pm_resume(args,source,run)) # automatic separate destination
+                args.pm_directory=output.name # explicitly reusing a mixed-case destination must fail
+                with self.assertRaisesRegex(ValueError,'selected models'):
+                    pipeline.check_pm_resume(args,source,run)
+                args.model_cases='both'
+                args.pm_directory=None
                 args.pm_angles='0,30,90'
                 with self.assertRaisesRegex(ValueError,'P-M settings'):
                     pipeline.check_pm_resume(args,source,run)
@@ -1246,6 +1382,82 @@ class SkipSweepTests(unittest.TestCase):
 
 
 class FamilyPipelineTests(unittest.TestCase):
+    def test_pm_manifest_cannot_deliver_unselected_models(self):
+        import abaqus_family_pipeline as p
+        import abaqus_pm_interaction as pm
+        from pathlib import Path
+        with tempfile.TemporaryDirectory(dir=os.path.dirname(__file__)) as directory:
+            output=Path(directory)
+            job='PM_P00_LG_mp';inp=output/(job+'.inp');inp.write_text('input')
+            (output/pm.MANIFEST_FILE).write_text(json.dumps(dict(mode='gmnia',
+                cases=['STEP4_LG_mp'],jobs=[dict(job=job)])))
+            (output/pm.SECTION_FILE).write_text('{}')
+            (output/(job+'_step5.json')).write_text(json.dumps(dict(stage=5,job_name=job,
+                input_sha256=p.file_sha256(inp),load_case=dict(type='combined'),
+                end_condition=dict(id=p.STEP5_END_CONDITION_ID))))
+            with self.assertRaisesRegex(ValueError,'selected models'):
+                p.pm_input_record(output,dict(models=['PERFECT']))
+
+    def test_model_case_selection_defaults_and_separate_destinations(self):
+        import abaqus_family_pipeline as p
+        base=['--family-root','source','--output-root','output']
+        expected={'both':(['PERFECT','STEP4_LG_mp'],{'STEP5_PERFECT_FY240','STEP5_LG_mp_FY240'}),
+                  'perfect':(['PERFECT'],{'STEP5_PERFECT_FY240'}),
+                  'imperfect':(['STEP4_LG_mp'],{'STEP5_LG_mp_FY240'})}
+        for selection,(models,jobs) in expected.items():
+            with self.subTest(selection=selection):
+                args=p.parse_arguments(base+['--model-cases',selection])
+                suffix='' if selection=='both' else '_'+selection.upper()+'_ONLY'
+                self.assertEqual(p.selected_models(args),models)
+                self.assertEqual(p.expected_jobs(args),jobs)
+                self.assertEqual(args.step5_directory,'Step5_GMNIA_FY240_LG_REF1'+suffix)
+                self.assertEqual(p.pm_directory(args),'Step5_PM_FY240_LG_REF1'+suffix)
+        self.assertEqual(p.parse_arguments(base).model_cases,'both')
+        args=p.parse_arguments(base+['--model-cases','perfect','--step5-directory','single','--pm-directory','pm_single'])
+        self.assertEqual((args.step5_directory,p.pm_directory(args)),('single','pm_single'))
+        with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+            p.parse_arguments(base+['--model-cases','unknown'])
+
+    def test_completed_pm_prints_diagram_path_without_launching_a_process(self):
+        import abaqus_family_pipeline as p
+        fixture=WorkflowAlignmentTests()
+        with fixture.completed_family() as (_,args,source,run,unused):
+            args.pm_directory='Step5_PM_full'
+            stream=io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                p.run_family_pm(args,source,run,None,
+                    mock.Mock(side_effect=AssertionError('must not launch')),'test',state=dict(completed=True))
+            target=run/'imperfection'/'Step5_PM_full'/'diagram'/'PM_interaction.png'
+            self.assertIn(str(target),stream.getvalue())
+
+    def test_pm_directory_supports_new_rays_without_overwriting_existing_attempt(self):
+        import abaqus_family_pipeline as p
+        base=['--family-root','source','--output-root','output','--pm-interaction']
+        args=p.parse_arguments(base+['--pm-directory','Step5_PM_full','--pm-angles','0,45,90'])
+        self.assertEqual(p.pm_directory(args),'Step5_PM_full')
+        self.assertEqual(p.pm_directory(p.parse_arguments(base)),'Step5_PM_FY240_LG_REF1')
+        for name in ('..','nested/path','nested\\path','C:\\output'):
+            with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):
+                p.parse_arguments(base+['--pm-directory',name])
+        fixture=WorkflowAlignmentTests()
+        with fixture.completed_family() as (_,args,source,run,unused):
+            old=run/'imperfection'/p.pm_directory(args);old.mkdir()
+            (old/p.PM_RECEIPT).write_text('existing attempt')
+            args.pm_directory='Step5_PM_full';args.pm_angles='0,45,90'
+            self.assertIsNone(p.check_pm_resume(args,source,run))
+            self.assertEqual((old/p.PM_RECEIPT).read_text(),'existing attempt')
+
+    def test_family_pm_axial_only_request_warns_before_launching(self):
+        import abaqus_family_pipeline as p
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            args=p.parse_arguments(['--family-root','source','--output-root','output',
+                '--pm-interaction','--pm-angles','0'])
+        self.assertEqual(args.pm_angles,'0')
+        self.assertIn('WARNING',output.getvalue())
+        self.assertIn('axial',output.getvalue())
+        self.assertIn('0,15,30,45,60,75,90',output.getvalue())
+
     def test_family_pipeline_longitudinal_lines_match_builder_limits(self):
         p = self.pipeline_module()
         base = ['--family-root', '.', '--output-root', 'out', '--repo', '.']
@@ -1619,6 +1831,125 @@ class PlateCaeIntegrationTests(unittest.TestCase):
                     os.chdir(previous)
         finally:
             database.close()
+
+
+
+
+class PmOnlyPipelineTests(unittest.TestCase):
+    """Small orchestration checks; no native Abaqus or existing result files."""
+    def setUp(self):
+        from pathlib import Path
+        import shutil
+        import uuid
+        import abaqus_family_pipeline as pipeline
+        self.p=pipeline
+        self.root=Path(__file__).resolve().parent/('pm_only_test_'+uuid.uuid4().hex)
+        self.root.mkdir()
+        self.addCleanup(shutil.rmtree,self.root)
+        self.family=self.root/'source'/'family_1';self.family.mkdir(parents=True)
+        self.args=pipeline.parse_arguments(['--family-root',str(self.family.parent),
+            '--output-root',str(self.root/'out'),'--pm-only','--parallel-jobs','auto','--resume'])
+        self.run=pipeline.batch_output_directory(self.args)/pipeline.family_run_name(self.args,self.family)
+        self.run.mkdir(parents=True)
+        self.cae=self.run/'imperfection'/'Step4_LG.cae'
+        self.cae.parent.mkdir();self.cae.write_text('step4')
+
+    def test_default_stays_standalone_and_sequential(self):
+        args=self.p.parse_arguments(['--family-root','source','--output-root','out'])
+        self.assertFalse(args.pm_only)
+        self.assertFalse(args.pm_interaction)
+        self.assertEqual(args.parallel_jobs,'1')
+
+    def test_pm_only_implies_interaction_and_accepts_shared_job_budget(self):
+        self.assertTrue(self.args.pm_interaction)
+        self.assertEqual(self.args.parallel_jobs,'auto')
+        for value in ('0','-1','1.5'):
+            with self.subTest(value=value),contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    self.p.parse_arguments(['--family-root','source','--output-root','out','--parallel-jobs',value])
+
+    def test_verified_step4_skips_all_standalone_processing(self):
+        progress=dict(step4=True,completed=True)  # no standalone entries required
+        with mock.patch.object(self.p,'preflight',return_value=[(self.family,self.run,progress)]), \
+                mock.patch.object(self.p,'run_family_pm') as pm, \
+                mock.patch.object(self.p,'check_step5_inputs',side_effect=AssertionError('standalone input check')), \
+                mock.patch.object(self.p,'refresh_step5_reference_plots',side_effect=AssertionError('standalone plots')), \
+                mock.patch.object(self.p,'update_family_plot',side_effect=AssertionError('standalone comparison')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.p.run_pipeline(self.args,runner=mock.Mock(side_effect=AssertionError('native command')),abaqus='fake_abaqus')
+        pm.assert_called_once()
+
+    def resume_fixture(self):
+        state=dict(status='BUILT',settings=dict(vars(self.args),builtup_dir=str(self.family)),build=dict(job_name='BASE'))
+        from pathlib import Path
+        state['settings']={k:str(v) if isinstance(v,Path) else v for k,v in state['settings'].items()}
+        (self.run/'pipeline_status.json').write_text(json.dumps(state))
+        (self.run/'BASE.inp').write_text('base');(self.run/'BASE.cae').write_text('base')
+        (self.cae.parent/self.p.STEP4_RECEIPT).write_text(json.dumps(dict(verified='step4')))
+
+    def test_resume_pm_only_does_not_require_or_inspect_standalone(self):
+        self.resume_fixture()
+        # Existing unrelated/partial standalone output must not gate a verified Step4.
+        (self.cae.parent/self.args.step5_directory).mkdir()
+        with mock.patch.object(self.p,'family_args',side_effect=lambda a,r:a), \
+                mock.patch.object(self.p,'check_source_inputs'), \
+                mock.patch.object(self.p,'step4_receipt',return_value=dict(verified='step4')), \
+                mock.patch.object(self.p,'check_step5_inputs',side_effect=AssertionError('standalone inputs')):
+            progress=self.p.check_resume_build(self.args,self.family,self.run)
+        self.assertTrue(progress['step4'])
+        self.assertFalse(progress['step5'])
+        self.assertFalse(progress['completed'])
+
+    def test_resume_pm_only_checks_step4_checkpoint(self):
+        self.resume_fixture()
+        with mock.patch.object(self.p,'family_args',side_effect=lambda a,r:a), \
+                mock.patch.object(self.p,'check_source_inputs'), \
+                mock.patch.object(self.p,'step4_receipt',return_value=dict(verified='changed')):
+            with self.assertRaisesRegex(ValueError,'Step4 settings/source files differ'):
+                self.p.check_resume_build(self.args,self.family,self.run)
+
+    def test_pm_only_keeps_step4_preparation_then_skips_standalone_build(self):
+        from pathlib import Path
+        self.resume_fixture()
+        for kind in ('L','G'):
+            ref=Path(str(self.run)+'_REF_'+kind);ref.mkdir()
+            (ref/'gdlc_reference.json').write_text(json.dumps(dict(kind=kind,job='REF_'+kind)))
+            (ref/('REF_'+kind+'.odb')).write_text('reference')
+        calls=[]
+        def runner(command,cwd,label):
+            calls.append(label)
+            if 'STEP5' in label:raise AssertionError('standalone Step5 must be skipped')
+        with mock.patch.object(self.p,'preflight',return_value=[(self.family,self.run,{})]), \
+                mock.patch.object(self.p,'family_args',side_effect=lambda a,r:a), \
+                mock.patch.object(self.p,'check_global_reference'), \
+                mock.patch.object(self.p,'reference_ready',return_value=True), \
+                mock.patch.object(self.p,'completed_reference',return_value=True), \
+                mock.patch.object(self.p,'step4_receipt',return_value=dict(verified='step4')), \
+                mock.patch.object(self.p,'run_family_pm') as pm, \
+                mock.patch.object(self.p,'check_step5_inputs',side_effect=AssertionError('standalone inputs')), \
+                mock.patch.object(self.p,'update_family_plot',side_effect=AssertionError('standalone plot')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.p.run_pipeline(self.args,runner=runner,abaqus='fake_abaqus')
+        self.assertTrue(any(label.endswith('| STEP4') for label in calls))
+        self.assertFalse(any('STEP5' in label for label in calls))
+        pm.assert_called_once()
+
+    def test_pm_queue_receives_parallel_jobs(self):
+        import abaqus_step5_queue as queue
+        output=self.run/'imperfection'/self.p.pm_directory(self.args);output.mkdir()
+        (output/'STEP5_PM_points.csv').write_text('point')
+        state=dict(completed=False,queue_completed=False,record=dict(files={'PM_TEST.inp':'hash'}))
+        calls=[]
+        with mock.patch.object(self.p,'read_json',return_value=[dict(model='PM_TEST')]), \
+                mock.patch.object(self.p,'pm_plot_current',return_value=True), \
+                mock.patch.object(queue,'processed_result',return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.p.run_family_pm(self.args,self.family,self.run,'fake_abaqus',
+                lambda cmd,cwd,label:calls.append((cmd,label)),'family',state=state)
+        self.assertEqual(len(calls),1)
+        command,label=calls[0]
+        self.assertTrue(label.endswith('P-M SOLVE QUEUE'))
+        self.assertEqual(command[command.index('--parallel-jobs')+1],'auto')
 
 
 if __name__ == '__main__':

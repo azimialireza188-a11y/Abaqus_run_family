@@ -3,22 +3,32 @@
 
 abaqus cae noGUI=abaqus_step5_queue_nogui.py -- --run-dir DIR --repair-only --cpus 4
 Then run the regenerated run_step5_queue_<ratio>_pct.bat. No model rebuild needed.
---cpus N|auto: CPUs of every Abaqus job of the queue (auto = all physical cores; a
-request above the physical cores of this machine uses all of them). Options are
+--cpus N|auto: total solver CPU budget (auto = all physical cores), shared when
+--parallel-jobs N|auto is enabled. Auto runs up to two jobs; default is serial.
+No CPU, GPU or memory capacity is reserved. Options are
 written '--name value': the Abaqus launcher rejects '--name=value'.
 Monitor mode needs no Fortran compiler; it stops at first OBSERVED crossing.
 """
 import argparse
+import bisect
 import csv
 import glob
+import getpass
+import hashlib
 import json
 import math
 import os
+import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from html import escape
 from types import SimpleNamespace
 
@@ -38,6 +48,143 @@ from abaqus_step5_progress import report, elapsed_text
 
 PM_SUMMARY_FIELDS = ['pm_selection_kind','pm_selection_frame','pm_selection_lpf','pm_selected_P_kN',
                      'pm_selected_M_kNm','pm_selection_verified','pm_selection_provisional','pm_selection_diagnostics']
+
+JOB_TIME_LIMIT_SECONDS = 60.*60.
+TIME_LIMIT_SHUTDOWN_SECONDS = 60.
+TIME_LIMIT_FIELDS = ('time_limit_seconds','time_limit_reached','time_limit_termination_confirmed',
+                     'termination_reason','elapsed_seconds','curve_unavailable_reason')
+
+
+class SolverShutdownError(RuntimeError):
+    """A native solver may still be running; do not refill its resource slot."""
+
+
+def confirmed_time_limit(result):
+    """Distinguish a deliberate, completed time stop from an unresolved live job."""
+    return (result.get('time_limit_reached') is True and
+            result.get('time_limit_termination_confirmed') is True and
+            result.get('termination_requested') is True and
+            result.get('termination_command_exit_code') == 0 and
+            result.get('solver_exit_code') is not None and
+            result.get('analysis_state') not in ('RUNNING','FAILED') and
+            not result.get('preprocessing_failed'))
+
+
+def parallel_request(value):
+    if str(value).lower() == 'auto':
+        return 'auto'
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError('parallel jobs must be auto or a positive integer')
+    if count < 1:
+        raise argparse.ArgumentTypeError('parallel jobs must be auto or a positive integer')
+    return count
+
+
+def parallel_policies(policy, request, count):
+    """Share the entire requested CPU/RAM budget; one slot owns all requested GPUs.
+
+    GPU counts alone cannot select disjoint physical devices through every Abaqus
+    launcher, so other slots explicitly request zero GPUs. No resources reserved.
+    """
+    request = parallel_request(request)
+    # Abaqus integer percentage memory has 100 independently assignable shares.
+    workers = min(max(1, count), policy.cpus, 100, 2 if request == 'auto' else request)
+    cpus, extra_cpus = divmod(policy.cpus, workers)
+    memory, extra_memory = divmod(100, workers)
+    return [SimpleNamespace(cpus=cpus + (i < extra_cpus), gpus=policy.gpus if i == 0 else 0,
+                            memory_percent=memory + (i < extra_memory))
+            for i in range(workers)]
+
+
+@contextmanager
+def queue_claim(directory):
+    """An OS lock releases on crash; never remove another manager's lock file."""
+    path = os.path.join(directory, 'STEP5_queue.lock')
+    stream = open(path, 'a+b')
+    acquired = False
+    try:
+        stream.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            if os.path.getsize(path) == 0:
+                stream.write(b' '); stream.flush(); stream.seek(0)
+            try:
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as error:
+                raise ValueError('Another queue manager is active in '+directory) from error
+        else:
+            import fcntl
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                raise ValueError('Another queue manager is active in '+directory) from error
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            stream.seek(0)
+            if os.name == 'nt':
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
+
+
+def solver_results(names, args, policies):
+    """Yield completed native jobs; the caller alone extracts ODBs and writes plots.
+
+    Each slot refills independently, including while the main thread extracts a
+    previous ODB. Fixed slot CPU/RAM/GPU budgets never overlap. Closing the
+    generator terminates outstanding jobs.
+    """
+    stop = threading.Event()
+    worker_args = SimpleNamespace(**vars(args))
+    worker_args.queue_cancel = stop
+    worker_args.isolated_solver = len(policies) > 1
+    pool = ThreadPoolExecutor(max_workers=len(policies))
+    pending = iter(names)
+    take_lock = threading.Lock()
+    completed = queue.Queue()
+
+    def consume(policy):
+        while not stop.is_set():
+            with take_lock:
+                name = next(pending, None)
+            if name is None:
+                return
+            try:
+                result = run_job(name, worker_args, policy)
+            except SolverShutdownError as error:
+                stop.set()
+                completed.put((name,error))
+                return
+            except Exception as error:
+                result = dict(model=name, criterion_reached=False, error=str(error), outcome='SOLVER_ERROR')
+            completed.put((name, result))
+
+    try:
+        workers = [pool.submit(consume, policy) for policy in policies]
+        for _ in names:
+            while True:
+                try:
+                    row = completed.get(timeout=.25)
+                except queue.Empty:
+                    # Never hang on an unexpected worker BaseException.
+                    for worker in workers:
+                        if worker.done():
+                            worker.result()
+                    continue
+                if isinstance(row[1],SolverShutdownError):
+                    raise row[1]
+                yield row
+                break
+    finally:
+        stop.set()
+        pool.shutdown(wait=True, cancel_futures=True)
 
 def crossing(values, ratio):
     if not 0 < ratio < 1:
@@ -74,6 +221,8 @@ def outcome(result, reached):
     state = result.get('analysis_state')
     if state == 'FAILED':
         return 'SOLVER_ERROR'
+    if confirmed_time_limit(result):
+        return 'TIME_LIMIT'
     if code is not None and code != 0 and not (result.get('termination_requested') and reached):
         return 'SOLVER_ERROR'
     if state == 'RUNNING' or (state in ('INCOMPLETE', 'TERMINATED') and
@@ -98,6 +247,7 @@ def launch(cmd, **kwargs):
 
 def plot_png(path, curves, yield_lines, title, axes=None, styles=None):
     axes = axes or fd.RESPONSE_AXES['compression']
+    references = fd.normalize_capacity_lines(yield_lines, axes)
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -122,12 +272,13 @@ def plot_png(path, curves, yield_lines, title, axes=None, styles=None):
                                 yValuesLabel=axes['queue_y_short'], legendLabel=label)
             abq_curves.append(session.Curve(xyData=xy)); names.append(name)
         xs = [x for _, points in curves for x, _ in points]
-        for i, value in enumerate(yield_lines):
+        for i, reference in enumerate(references):
+            value = reference['value']
             name = 'STEP5_QUEUE_YIELD_%d' % i
             if name in session.xyDataObjects:
                 del session.xyDataObjects[name]
             xy = session.XYData(name=name, data=((min(xs),value),(max(xs),value)),
-                                legendLabel=axes['capacity_label'] % value,
+                                legendLabel=reference['label'],
                                 xValuesLabel=axes['queue_x_label'], yValuesLabel=axes['queue_y_short'])
             abq_curves.append(session.Curve(xyData=xy)); names.append(name)
         chart.setValues(curvesToPlot=tuple(abq_curves))
@@ -145,8 +296,8 @@ def plot_png(path, curves, yield_lines, title, axes=None, styles=None):
         style = styles[i] if styles is not None else {}
         ax.plot([p[0] for p in points], [p[1] for p in points], label=label, lw=1.6,
                 color=style.get('color'), ls='--' if style.get('dash') else '-')
-    for y in yield_lines:
-        ax.axhline(y, ls='--', label=axes['capacity_label'] % y)
+    for reference in references:
+        ax.axhline(reference['value'], ls='--', label=reference['label'])
     ax.set(xlabel=axes['x_label'], ylabel=axes['queue_y_label'], title=title)
     ax.grid(alpha=.25)
     if styles is None:
@@ -159,8 +310,9 @@ def plot_png(path, curves, yield_lines, title, axes=None, styles=None):
 
 def plot_svg(path, curves, yield_lines, title, axes=None, styles=None):
     axes = axes or fd.RESPONSE_AXES['compression']
+    references = fd.normalize_capacity_lines(yield_lines, axes)
     xs = [x for _, points in curves for x, _ in points]
-    ys = [y for _, points in curves for _, y in points]+list(yield_lines)+[0.0]
+    ys = [y for _, points in curves for _, y in points]+[line['value'] for line in references]+[0.0]
     xmin, xmax = min(xs), max(xs); ymin, ymax = min(ys), max(ys)
     dx, dy = max(1e-6, xmax-xmin), max(1e-6, ymax-ymin)
     xmin -= .04*dx; xmax += .04*dx; ymax += .08*dy
@@ -191,9 +343,15 @@ def plot_svg(path, curves, yield_lines, title, axes=None, styles=None):
         lx,ly=115+(i%3)*420,775+(i//3)*22
         lines.append('<path d="M %d %d h 35" stroke="%s" stroke-width="2"%s/>'%(lx,ly-5,color,dash))
         lines.append('<text x="%d" y="%d" fill="%s">%s</text>' % (lx+42,ly,color,escape(label)))
-    for value in yield_lines:
+    for item, reference in zip(yield_lines, references):
+        value = reference['value']
         lines.append('<path d="M 110 %.2f H 1160" stroke="#1676c3" stroke-dasharray="8 5"/>' % sy(value))
-        lines.append('<text x="1170" y="%.2f">%s</text>' % (sy(value),escape(axes['capacity_label'].replace(' = ', ' ') % value)))
+        if isinstance(item, dict):
+            lines.append('<text x="1150" y="%.2f" text-anchor="end">%s</text>' %
+                         (sy(value)-6, escape(reference['label'])))
+        else:
+            lines.append('<text x="1170" y="%.2f">%s</text>' %
+                         (sy(value), escape(axes['capacity_label'].replace(' = ', ' ') % value)))
     lines += ['<path d="M 110 90 V 670 H 1160" fill="none" stroke="black"/>',
               '<text x="630" y="740" text-anchor="middle">%s</text>' % escape(axes['x_label']),
               '<text transform="translate(30,380) rotate(-90)" text-anchor="middle">%s</text>' % escape(axes['queue_y_label']),
@@ -208,7 +366,16 @@ PM_FIELDS = ['model','load_case','bending_axis_deg','pm_angle_deg','source_case'
              'selection_policy','selection_diagnostics']
 
 
-def write_comparison(directory, curves, yield_lines, summaries, axes=None,interaction=True):
+def merge_capacity_lines(target, values, axes):
+    """Deduplicate benchmarks by value and identity, preserving legacy numeric callers."""
+    for item, line in zip(values, fd.normalize_capacity_lines(values, axes)):
+        existing = fd.normalize_capacity_lines(target, axes)
+        if not any(math.isclose(line['value'], old['value'], rel_tol=1e-10)
+                   and line['label'] == old['label'] for old in existing):
+            target.append(item)
+
+
+def write_comparison(directory, curves, yield_lines, summaries, axes=None,interaction=True,report_reference=None):
     axes = axes or fd.RESPONSE_AXES['compression']
     if axes['kind'] == 'combined':
         fields = ['model','source_case','bending_axis_deg','pm_angle_deg','a_L_mm','a_D_mm','a_G_mm','force_kN',
@@ -220,7 +387,8 @@ def write_comparison(directory, curves, yield_lines, summaries, axes=None,intera
     else:
         fields = ['model','a_L_mm','a_D_mm','a_G_mm','force_kN','Py_kN','Pu_over_Py','shortening_mm',
                   'criterion_reached','outcome','solver_exit_code','error']
-    fields += ['analysis_completed','analysis_state','partial','capacity_verified','peak_interpretation']+PM_SUMMARY_FIELDS
+    fields += list(TIME_LIMIT_FIELDS)+['analysis_completed','analysis_state','partial','capacity_verified','peak_interpretation',
+               'path_review_required','postpeak_path_check']+PM_SUMMARY_FIELDS
     with open(os.path.join(directory,'STEP5_peak_summary.csv'),'w',newline='',encoding='utf-8-sig') as f:
         writer=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');writer.writeheader()
         writer.writerows(summaries)
@@ -244,7 +412,7 @@ def write_comparison(directory, curves, yield_lines, summaries, axes=None,intera
                 with open(path,encoding='utf-8') as stream:reference=json.load(stream)
                 sections={key:dict(data,fy_MPa=reference.get('fy_MPa'))
                           for key,data in reference['axes'].items()}
-            pm.plot_interaction(directory,points,sections)
+            pm.plot_interaction(directory,points,sections,report_reference=report_reference)
     if not curves:
         return
     stem = os.path.join(directory, axes['combined'])
@@ -444,7 +612,12 @@ def solver_progress(directory, name, elapsed, values, requested):
         peak = max(values)
         parts.append('LPF=%g; peak LPF=%g' % (values[-1], peak))
         if peak > 0:
-            parts.append('P/Pmax=%.3f (latest available ODB sample)' % (values[-1]/peak))
+            parts.append('P/Pmax=%.3f (latest converged STA sample; not completion percent)' % (values[-1]/peak))
+    records = read_sta_lpf(os.path.join(directory, name+'.sta'))
+    if records:
+        parts.append('step=%d; increment=%d; attempt=%d' %
+                     tuple(records[-1][key] for key in ('step','increment','attempt')))
+    parts.append('completion=unknown (adaptive Riks); time limit=60 min')
     status = latest_line(os.path.join(directory, name+'.sta'))
     if status:
         parts.append('STA latest: '+status)
@@ -455,14 +628,198 @@ def solver_progress(directory, name, elapsed, values, requested):
     return ' | '.join(parts)
 
 
+def publish_response_reports(directory):
+    """Use the launching Python's plotting stack, not CAE's optional matplotlib."""
+    python = os.environ.get('STEP5_REPORT_PYTHON')
+    if python:
+        environment = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1')
+        # Abaqus may replace Python's home/search path with its own interpreter.
+        environment.pop('PYTHONHOME', None)
+        environment['PYTHONPATH'] = SCRIPT_DIR
+        if environment.get('STEP5_REPORT_PATH'):
+            environment['PATH'] = environment['STEP5_REPORT_PATH']
+        try:
+            child = subprocess.run([python, '-B', os.path.join(SCRIPT_DIR, 'abaqus_step5_force_displacement_core.py'),
+                                    '--publish-responses', '--run-dir', str(directory)], check=True,
+                                   env=environment, capture_output=True, text=True, encoding='utf-8', errors='replace')
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError('Response report failed: '+(error.stderr or error.stdout or str(error))[-4000:]) from error
+        if isinstance(child.stdout, str):
+            for line in child.stdout.splitlines():
+                report('RESPONSE REPORT READY', line)
+    else:
+        # Direct CAE users get the same reports when matplotlib is installed there.
+        fd.publish_queue_responses(directory)
+
+
+def native_path_lengths(directory, name):
+    """Budget paths expanded internally by Standard, including scratch children."""
+    username = getpass.getuser()
+    user_component = username if len(username) >= 32 else 'u'*32
+    native_child = user_component+'_'+name+'_'+'9'*10
+    return dict(artifacts=len(os.path.join(directory, name+'_queue_solver.log')),
+                preprocessor=len(os.path.join(directory, native_child, name+'_f.inp')))
+
+
+def queue_path(path):
+    """Normalize native spelling without changing the filesystem destination."""
+    path = os.path.normpath(os.path.abspath(path))
+    if os.name == 'nt':
+        if path[:8].upper() == '\\\\?\\UNC\\':
+            path = '\\\\'+path[8:]
+        elif path.startswith('\\\\?\\') and len(path)>6 and path[5]==':':
+            path = path[4:]
+    return os.path.normpath(path)
+
+
+def same_queue_path(first, second):
+    """Accept equivalent Win32/extended/8.3 names, using OS identity if needed.
+
+    Owned paths must separately pass the reparse-point check; samefile alone
+    would follow a junction and is not a containment check.
+    """
+    first, second = queue_path(first), queue_path(second)
+    if os.path.normcase(first) == os.path.normcase(second):
+        return True
+    try:
+        if os.path.exists(first) and os.path.exists(second):
+            return os.path.samefile(first, second)
+        return (os.path.normcase(os.path.basename(first)) == os.path.normcase(os.path.basename(second)) and
+                os.path.samefile(os.path.dirname(first), os.path.dirname(second)))
+    except OSError:
+        return False
+
+
+def owned_queue_child(parent, leaf, label):
+    """Require a direct, non-reparse child before creation, delivery or cleanup."""
+    parent = queue_path(parent)
+    path = queue_path(os.path.join(parent, leaf))
+    try:
+        entry = os.lstat(path)
+    except FileNotFoundError:
+        entry = None
+    if entry is not None and (stat.S_ISLNK(entry.st_mode) or
+            getattr(entry, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)):
+        raise ValueError('Parallel '+label+' path is redirected (link/junction); refusing to use '+path)
+    resolved = os.path.realpath(path)
+    if (not same_queue_path(path, resolved) or
+            not same_queue_path(parent, os.path.dirname(resolved))):
+        raise ValueError('Parallel '+label+' path is redirected; refusing to use '+path+'; resolved='+resolved)
+    return path
+
+
+def parallel_scratch(directory, name):
+    """Use a short, per-queue/job scratch path, independent of output depth."""
+    job_command(name, 1, 0, 'monitor')
+    identity = os.path.normcase(queue_path(os.path.realpath(directory)))+'\0'+name
+    key = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:16]
+    for base in (SCRIPT_DIR, tempfile.gettempdir()):
+        base = queue_path(os.path.realpath(base))
+        root = os.path.join(base, '.abq_scratch')
+        scratch = os.path.join(root, key)
+        if native_path_lengths(scratch, name)['preprocessor'] >= 240:
+            continue
+        root = owned_queue_child(base, '.abq_scratch', 'scratch')
+        return owned_queue_child(root, key, 'scratch')
+    raise ValueError('Abaqus scratch paths exceed the native path limit; shorten the repository or TEMP path')
+
+
+def parallel_workspace(directory, name):
+    """Reject redirected work roots before any native output move or deletion."""
+    job_command(name, 1, 0, 'monitor')
+    base = queue_path(os.path.realpath(directory))
+    root = owned_queue_child(base, '.queue_work', 'workspace')
+    key = 'j'+hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]
+    work = owned_queue_child(root, key, 'workspace')
+    if native_path_lengths(work, name)['artifacts'] >= 256:
+        raise ValueError('Abaqus working file paths exceed the native path limit; shorten --output-root: '+work)
+    return work
+
+
+def validate_parallel_source(directory, name):
+    # Generated Step5 inputs are self-contained. Refuse external dependencies
+    # rather than silently changing their relative paths in an isolated solve.
+    work = parallel_workspace(directory, name)
+    scratch = parallel_scratch(directory, name)
+    source = os.path.join(directory, name+'.inp')
+    with open(source, encoding='utf-8', errors='replace') as stream:
+        text = stream.read()
+    if re.search(r'^\s*\*(?:include\b|imperfection\s*,[^\n]*\bfile\s*=)', text, re.I | re.M):
+        raise ValueError('Parallel solver input has external INCLUDE/IMPERFECTION dependencies; use --parallel-jobs 1')
+    legacy = os.path.join(os.path.realpath(directory), '.queue_work', name)
+    for occupied in (work, legacy, scratch):
+        if os.path.lexists(occupied):
+            raise ValueError('Existing parallel solver workspace/scratch is preserved: '+occupied+'; inspect it before another solve')
+    return source, work
+
+
 def run_job(name, args, policy):
+    if not getattr(args, 'isolated_solver', False):
+        return _run_job_native(name, args, policy)
+    source, work = validate_parallel_source(args.run_dir, name)
+    backup_failed_artifacts(args.run_dir, name)
+    scratch = parallel_scratch(args.run_dir, name)
+    os.makedirs(scratch)
+    os.makedirs(work)
+    shutil.copyfile(source, os.path.join(work, name+'.inp'))
+    for filename in ('abaqus_v6.env', 'step5_postpeak_stop.for'):
+        src = os.path.join(args.run_dir, filename)
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(work, filename))
+    private = SimpleNamespace(**vars(args))
+    private.run_dir = work
+    private.solver_scratch = scratch
+    try:
+        result = _run_job_native(name, private, policy)
+    except BaseException:
+        # A failed terminate/wait can leave a live solver; preserve its working
+        # directory and scratch rather than move/delete files underneath it.
+        report('WORKSPACE PRESERVED', work)
+        raise
+    else:
+        # Deliver only this job's native results after its solver has stopped.
+        # ODB extraction/plots remain serialized in the parent queue directory.
+        if not same_queue_path(parallel_workspace(args.run_dir, name), work):
+            raise ValueError('Parallel workspace changed during native solve; outputs preserved')
+        lock_path = os.path.join(work, name+'.lck')
+        for _ in range(30):
+            if not os.path.exists(lock_path):
+                break
+            time.sleep(1)
+        if os.path.exists(lock_path):
+            raise ValueError('Parallel solver workspace remains locked; preserved at '+work)
+        result.update(completion_details(work, name))
+        files = [entry for entry in os.scandir(work)
+                 if entry.is_file() and entry.name.startswith(name) and entry.name != name+'.inp']
+        if any(entry.name.endswith('.lck') for entry in files):
+            raise ValueError('Parallel solver workspace remains locked; preserved at '+work)
+        for entry in files:
+            target = os.path.join(args.run_dir, entry.name)
+            if os.path.exists(target):
+                raise ValueError('Refusing to replace existing solver output: '+target+'; workspace preserved at '+work)
+        for entry in files:
+            shutil.move(entry.path, os.path.join(args.run_dir, entry.name))
+        parallel_workspace(args.run_dir, name)
+        shutil.rmtree(work)
+        if not same_queue_path(parallel_scratch(args.run_dir, name), scratch):
+            raise ValueError('Parallel scratch changed during native solve; scratch preserved')
+        shutil.rmtree(scratch)
+        return result
+
+
+def _run_job_native(name, args, policy):
     path = os.path.join(args.run_dir,name+'.odb')
     if os.path.exists(path):
         raise ValueError('Existing ODB: '+path+'; use --extract-only to preserve/replot results, or a new run folder')
     result = dict(model=name,criterion_reached=False,stop_method=args.stop_method,
+                  time_limit_seconds=JOB_TIME_LIMIT_SECONDS,time_limit_reached=False,
                   previous_artifacts=backup_failed_artifacts(args.run_dir,name))
     abaqus_cmd = getattr(args, 'abaqus_cmd', 'abaqus')
     cmd = job_command(name,policy.cpus,policy.gpus,args.stop_method,abaqus_cmd)
+    cmd = [item if item != 'memory=100%' else 'memory=%d%%' % getattr(policy, 'memory_percent', 100)
+           for item in cmd]
+    if getattr(args, 'solver_scratch', None):
+        cmd.append('scratch='+args.solver_scratch)
     report('SUBMIT', subprocess.list2cmdline(cmd))
     log_path = os.path.join(args.run_dir, name+'_queue_solver.log')
     report('SOLVER LOG', log_path)
@@ -472,9 +829,30 @@ def run_job(name, args, policy):
     with open(log_path,'w') as log:
         process = launch(cmd,cwd=args.run_dir,stdout=log,stderr=subprocess.STDOUT)
         requested = False
+        shutdown_started = None
         last_warning = ''
         try:
             while process.poll() is None:
+                now = time.monotonic()
+                if getattr(args, 'queue_cancel', None) is not None and args.queue_cancel.is_set():
+                    raise RuntimeError('Queue interrupted; terminating '+name)
+                if now-started >= JOB_TIME_LIMIT_SECONDS and not result['time_limit_reached']:
+                    result.update(time_limit_reached=True,termination_reason='TIME_LIMIT')
+                    report('TIME LIMIT',name+' | 60-minute per-job limit reached; requesting native termination')
+                    log.write('\nQUEUE_TIME_LIMIT: 60 minutes reached; native termination requested\n')
+                    log.flush()
+                    try:
+                        control=launch([abaqus_cmd,'terminate','job='+name],cwd=args.run_dir)
+                        code=control.wait(timeout=30)
+                        result['termination_command_exit_code']=code
+                        if code != 0:
+                            raise RuntimeError('Abaqus terminate command failed: %s' % code)
+                    except Exception as error:
+                        raise SolverShutdownError('Time-limit termination could not be confirmed for '+name+': '+str(error)) from error
+                    requested=True
+                    shutdown_started=now
+                if shutdown_started is not None and now-shutdown_started >= TIME_LIMIT_SHUTDOWN_SECONDS:
+                    raise SolverShutdownError('Time-limit shutdown did not finish for '+name+'; native workspace preserved')
                 if args.stop_method == 'monitor' and not requested:
                     try:
                         sta_path = os.path.join(args.run_dir, name+'.sta')
@@ -482,7 +860,7 @@ def run_job(name, args, policy):
                         values = [record['lpf'] for record in sta_records]
                         hit = crossing_sta(sta_records, args.ratio)
                         if hit:
-                            report('STOP REQUEST', '%s | STA post-peak ratio %.3f (conservative %.3f) <= %.3f; requesting Abaqus termination' %
+                            report('STOP REQUEST', '%s | observed STA load-drop ratio %.3f (conservative %.3f) <= %.3f; requesting termination; response path must still be checked' %
                                    (name, hit['ratio'], hit['conservative_ratio'], args.ratio))
                             # Native job control; do not kill the launcher or edit solver files.
                             control = launch([abaqus_cmd,'terminate','job='+name],cwd=args.run_dir)
@@ -499,11 +877,14 @@ def run_job(name, args, policy):
                         message = str(error)
                         if message != last_warning:
                             report('MONITOR', name+': '+message);last_warning=message
-                now = time.monotonic()
                 if now >= next_progress:
                     report('SOLVING', solver_progress(args.run_dir, name, now-started, values, requested))
                     next_progress = now + getattr(args, 'progress_seconds', 15.0)
-                time.sleep(args.poll_seconds)
+                remaining=(JOB_TIME_LIMIT_SECONDS-(now-started) if shutdown_started is None else
+                           TIME_LIMIT_SHUTDOWN_SECONDS-(now-shutdown_started))
+                time.sleep(min(args.poll_seconds,max(.01,remaining)))
+        except SolverShutdownError:
+            raise
         except BaseException:
             control = launch([abaqus_cmd,'terminate','job='+name],cwd=args.run_dir)
             control.wait(timeout=30)
@@ -511,24 +892,48 @@ def run_job(name, args, policy):
             raise
         result['solver_exit_code'] = process.returncode
         result['termination_requested'] = requested
+    if result['time_limit_reached']:
+        # Native exit and released locks are required before another job uses
+        # this slot. Never kill only cmd.exe or extract/move a live ODB.
+        lock=os.path.join(args.run_dir,name+'.lck')
+        for _ in range(30):
+            if not os.path.exists(lock):break
+            time.sleep(1)
+        if os.path.exists(lock):
+            raise SolverShutdownError('Time-limited solver remains locked: '+name+'; workspace preserved')
+        result['time_limit_termination_confirmed']=True
+    result['elapsed_seconds']=time.monotonic()-started
     report('SOLVER EXIT', '%s | code=%s | elapsed=%s' %
-           (name, process.returncode, elapsed_text(time.monotonic()-started)))
-    if not os.path.isfile(path):
+           (name, process.returncode, elapsed_text(result['elapsed_seconds'])))
+    if not os.path.isfile(path) and not result['time_limit_reached']:
         with open(log_path,errors='replace') as log:
             diagnostic=log.read()[-6000:].strip()
         result['outcome']='SOLVER_ERROR'
         result['error']='Solver produced no ODB. '+(diagnostic or 'See '+name+'_queue_solver.log')
     result.update(completion_details(args.run_dir, name))
+    if confirmed_time_limit(result):
+        result['outcome']='TIME_LIMIT'
+    if result.get('preprocessing_failed'):
+        result['outcome'] = 'SOLVER_ERROR'
+        result['error'] = ('Abaqus preprocessing failed before analysis; an ODB header is not a solved model. '+
+                           '; '.join(result['completion_diagnostics']))
     return result
 
 
 def run(args):
+    with queue_claim(args.run_dir):
+        return _run_queue(args)
+
+
+def _run_queue(args):
     from abaqus_step5_gmnia import write_queue_batch
     report('VALIDATE', 'Checking queue inputs in '+args.run_dir)
     names = args.jobs or [os.path.splitext(os.path.basename(p))[0]
                          for pattern in ('STEP5_*.inp', 'PM_*.inp')
                          for p in sorted(glob.glob(os.path.join(args.run_dir,pattern)))]
     names = sorted(names, key=lambda name: (not name.startswith('STEP5_PERFECT_'), name))
+    if len(names) != len(set(os.path.normcase(name) for name in names)):
+        raise ValueError('Duplicate job names are not permitted in one queue')
     if not names:
         raise ValueError('No STEP5 inputs found in '+args.run_dir)
     for name in names:
@@ -541,6 +946,10 @@ def run(args):
     cae = args.cae or (caes[0] if len(caes)==1 else None)
     report('METADATA', 'Reading STEP5 metadata (sidecars, else %s)' % (cae or 'no CAE'))
     infos = metadata(cae,names,args.run_dir)
+    report_dir = getattr(args, 'cufsm_report_dir', None)
+    infos = {name: fd.with_report_reference(info, report_dir) for name, info in infos.items()}
+    report_reference = next((info.get('report_reference') for info in infos.values()
+                             if info.get('report_reference')), None)
     # Metadata is validated before any submission; all plots use P=LPF*P_ref.
     for name,info in infos.items():
         if int(info.get('settings',{}).get('field_frequency',1)) != 1:
@@ -559,10 +968,13 @@ def run(args):
     axes = fd.RESPONSE_AXES[kinds.pop()]
     report('RESOURCES', 'Detecting available CPUs and GPUs')
     policy=resources.resolve_solver_policy(resources.detect_resources(),args.cpus,args.gpus)
-    report('RESOURCES', 'cpus=%d gpus=%d memory=100%%; reserves=0' % (policy.cpus,policy.gpus))
+    slots = parallel_policies(policy, getattr(args, 'parallel_jobs', 1), len(names))
+    report('RESOURCES', 'total cpus=%d gpus=%d memory=100%%; parallel jobs=%d; reserves=0' %
+           (policy.cpus,policy.gpus,len(slots)))
     report('QUEUE', '%d jobs | mode=%s | post-peak stop=%.1f%% | progress every %g s' %
            (len(names), 'extract-only' if args.extract_only else args.stop_method,
             args.ratio*100, getattr(args, 'progress_seconds', 15.0)))
+    report('TIME LIMIT','Each submitted nonlinear job has its own 60-minute wall-clock limit; queue waiting time is excluded')
     if args.repair_only:
         # Same file name as the builder writes for this ratio (STEP5 or P-M queue).
         prefix = 'run_pm_queue_' if all(n.startswith('PM_') for n in names) else 'run_step5_queue_'
@@ -570,6 +982,12 @@ def run(args):
         write_queue_batch(path,names,args.cpus,cae=cae,
                           script=os.path.join(SCRIPT_DIR,'abaqus_step5_queue_nogui.py'),
                           ratio=args.ratio,stop_method=args.stop_method,gpus=args.gpus)
+        if getattr(args, 'parallel_jobs', 1) != 1:
+            with open(path, encoding='utf-8') as stream:
+                batch = stream.read()
+            batch = batch.replace('--stop-method ', '--parallel-jobs %s --stop-method ' % args.parallel_jobs)
+            with open(path, 'w', newline='') as stream:
+                stream.write(batch.replace('\r\n', '\n').replace('\n', '\r\n'))
         print('REPAIRED: '+path+'; inputs and CAE preserved; no analysis submitted')
         return
     # Refuse overwrite up front, rather than launch some jobs then discover old ODBs.
@@ -580,9 +998,12 @@ def run(args):
                 entry=completed_curve(args.run_dir,name,infos[name],args.ratio,allow_incomplete=True)
                 if entry is not None:
                     saved[name]=entry
+        slots = parallel_policies(policy, getattr(args, 'parallel_jobs', 1), len(names)-len(saved))
         for name in names:
             if name not in saved:
                 backup_failed_artifacts(args.run_dir, name)
+                if len(slots) > 1:
+                    validate_parallel_source(args.run_dir, name)
     else:
         saved={}
     if (args.stop_method=='urdfil' and not args.extract_only and len(saved)<len(names)
@@ -600,33 +1021,41 @@ def run(args):
             report('REUSE COMPLETED' if finished_result(result) else 'REUSE STOPPED CURVE',
                    name+' | '+result['peak_interpretation']+' | existing CSV; no solve or ODB extraction')
             summaries.append(result)
-            curves.append((curve_label(name,result),points))
-            y=(1. if axes['kind']=='combined' else float(infos[name]['first_yield_moment_Nmm'])/1e6
-               if axes['kind']=='bending' else float(infos[name]['end_area_mm2'])*float(infos[name]['settings']['fy'])/1000.)
-            if not any(math.isclose(y,old,rel_tol=1e-10) for old in yield_lines):yield_lines.append(y)
-            if result.get('error'):
+            if points:curves.append((curve_label(name,result),points))
+            individual_lines = fd.capacity_lines(infos[name])
+            merge_capacity_lines(yield_lines, individual_lines, axes)
+            if points and (result.get('error') or result.get('completion_reassessed') or infos[name].get('report_reference')):
                 stem=name+axes['stem']+('_partial' if result.get('partial') else '')
                 label=curve_label(name,result)
-                plot_svg(stem+'.svg',[(label,points)],[y],name+' - '+axes['title'],axes)
-                plot_png(stem+'.png',[(label,points)],[y],name+' - '+axes['title'],axes)
+                plot_svg(stem+'.svg',[(label,points)],individual_lines,name+' - '+axes['title'],axes)
+                plot_png(stem+'.png',[(label,points)],individual_lines,name+' - '+axes['title'],axes)
                 result.pop('error',None)
             result.pop('comparison_error',None)
         if len(saved)==len(names):
             # No solver or ODB work: only repair/recreate small comparison outputs.
-            write_comparison(args.run_dir,curves,yield_lines,summaries,axes)
+            write_comparison(args.run_dir,curves,yield_lines,summaries,axes,report_reference=report_reference)
             with open(status_path,'w') as stream:json.dump(summaries,stream,indent=2,allow_nan=False)
+            if axes['kind'] == 'combined':
+                publish_response_reports(args.run_dir)
+                for result in summaries:
+                    result.pop('response_report_error', None)
+                with open(status_path,'w') as stream:
+                    json.dump(summaries,stream,indent=2,allow_nan=False)
             report('QUEUE FINISHED','Saved curves reused; no analyses or ODB extraction.')
             return
-        for index,name in enumerate(names,1):
-            if name in saved:
-                continue
+        pending = [name for name in names if name not in saved]
+        if args.extract_only:
+            jobs = ((name, None) for name in pending)
+        else:
+            jobs = solver_results(pending, args, slots)
+        for index,(name, solved) in enumerate(jobs,len(saved)+1):
             report('JOB %d/%d' % (index,len(names)), name)
             result=dict(model=name,criterion_reached=False)
             if args.extract_only:
                 # Replotting cannot turn a previous solver failure into success.
                 prior = prior_results.get(name, {})
                 for key in ('solver_exit_code', 'termination_requested', 'termination_command_exit_code',
-                            'observed_crossing', 'monitor_source', 'stop_method'):
+                            'observed_crossing', 'monitor_source', 'stop_method')+TIME_LIMIT_FIELDS:
                     if key in prior:
                         result[key] = prior[key]
                 result.update(completion_details(args.run_dir, name))
@@ -636,7 +1065,7 @@ def run(args):
                           a_G_mm=case.get('global_component_mm'))
             try:
                 if not args.extract_only:
-                    result.update(run_job(name,args,policy))
+                    result.update(solved)
                     if result.get('error'):
                         raise RuntimeError(result['error'])
                 path=os.path.join(args.run_dir,name+'.odb')
@@ -650,7 +1079,8 @@ def run(args):
                     raise ValueError('ODB remains locked: '+path)
                 report('EXTRACT', name+' | reading %s results and writing CSV/SVG' % axes['response'])
                 summary=fd.extract(SimpleNamespace(cae=cae,odb=path,model=name,step='GMNIA',
-                                    output_dir=args.run_dir,allow_partial=True,skip_png=True))
+                                    output_dir=args.run_dir,allow_partial=True,skip_png=True,
+                                    cufsm_report_dir=report_dir))
                 # Re-read after solver locks were released and extraction closed the
                 # ODB; do not freeze an early, incomplete text-file snapshot.
                 result.update(completion_details(args.run_dir, name, summary.get('odb_job_status')))
@@ -669,8 +1099,10 @@ def run(args):
                 result['curve_available']=True
                 report('ANALYSIS STATUS', name+' | '+result['analysis_state']+' | '+
                        '; '.join(result['completion_diagnostics'] or result['completion_sources']))
-                valid = result['outcome'] in ('CRITERION_REACHED', 'CONTROLLED_TERMINATION')
-                capacity_status(result)
+                capacity_status(result, rows, axes)
+                valid = result['capacity_verified']
+                if result.get('path_review_required'):
+                    report('PATH REVIEW REQUIRED', name+' | load drop retraces the preceding response; observed peak is unverified')
                 label=curve_label(name,result)
                 curves.append((label,points))
                 info=infos[name]
@@ -702,24 +1134,42 @@ def run(args):
                 elif not finished_result(result) and processed_result(result):
                     report('CONTINUE AFTER STOP',name+' | '+result['outcome']+
                            ' | recorded curve retained; capacity unverified; continuing queue')
-                if not any(math.isclose(y,old,rel_tol=1e-10) for old in yield_lines):
-                    yield_lines.append(y)
+                individual_lines = fd.capacity_lines(info)
+                merge_capacity_lines(yield_lines, individual_lines, axes)
                 stem=os.path.splitext(summary['csv'])[0]
                 report('PLOT', name+' | writing %s PNG' % axes['response'])
-                plot_png(stem+'.png',[(label,points)],[y],name+' - '+axes['title'],axes)
+                plot_png(stem+'.png',[(label,points)],individual_lines,name+' - '+axes['title'],axes)
                 summary.update(queue_status=result,png=stem+'.png')
                 with open(os.path.splitext(summary['csv'])[0]+'.json','w',encoding='utf-8') as f:
                     json.dump(summary,f,indent=2,allow_nan=False)
             except Exception as error:
-                result['error']=str(error)
-                report('FAILED', name+': '+str(error))
+                if confirmed_time_limit(result) and not result.get('curve_available'):
+                    result.update(outcome='TIME_LIMIT',curve_available=False,capacity_verified=False,
+                                  peak_interpretation='TIME_LIMIT_NO_USABLE_RESPONSE',pm_point=None,
+                                  curve_unavailable_reason=str(error))
+                    report('TIME LIMIT WITHOUT CURVE',name+' | '+str(error)+'; continuing queue')
+                else:
+                    result['error']=str(error)
+                    report('FAILED', name+': '+str(error))
             summaries.append(result)
             with open(os.path.join(args.run_dir,'STEP5_queue_status.json'),'w') as f:
                 json.dump(summaries,f,indent=2,allow_nan=False)
+            if axes['kind'] == 'combined':
+                try:
+                    report('RESPONSE REPORTS', name+' | writing paired PNG/SVG/XLSX and response-path overview')
+                    publish_response_reports(args.run_dir)
+                    # The publisher repairs every finished history, including
+                    # records reused by a partial --resume, not only this job.
+                    for repaired in summaries:
+                        repaired.pop('response_report_error', None)
+                except Exception as error:
+                    # A report failure must never discard the extracted curve or rerun the solver.
+                    result['response_report_error'] = str(error)
+                    report('RESPONSE REPORT FAILED', name+' | '+str(error))
             try:
                 report('COMPARISON', 'Updating combined plots and peak summary (%d/%d jobs processed)' % (index,len(names)))
                 write_comparison(args.run_dir,curves,yield_lines,summaries,axes,
-                                 interaction=len(summaries)==len(names))
+                                 interaction=len(summaries)==len(names),report_reference=report_reference)
             except Exception as error:
                 report('COMPARISON FAILED', str(error))
                 summaries[-1]['comparison_error']=str(error)
@@ -727,10 +1177,22 @@ def run(args):
                 json.dump(summaries,f,indent=2,allow_nan=False)
             report('JOB %d/%d FINISHED' % (index,len(names)), name+' | '+
                    ('FAILED' if result.get('error') else result.get('outcome','UNKNOWN')))
+            report('QUEUE PROGRESS', '%d/%d processed (%.1f%%); includes stopped/failed analyses; not a capacity check' %
+                   (index, len(names), 100.*index/len(names)))
         report('QUEUE FINISHED', 'Check STEP5_queue_status.json and STEP5_peak_summary.csv.')
+        if any(row.get('response_report_error') for row in summaries):
+            raise RuntimeError('Response reports incomplete; saved curves are preserved for --resume; '+
+                               ' | '.join(row['model']+': '+row['response_report_error'] for row in summaries
+                                          if row.get('response_report_error')))
         if any(r.get('error') or r.get('comparison_error') or not processed_result(r) for r in summaries):
-            raise RuntimeError('Some curves/plots failed validation or solver status is unresolved; see queue status')
+            failures = [r.get('model', '?')+': '+str(r.get('error') or r.get('comparison_error') or
+                        r.get('analysis_state', 'UNKNOWN')) for r in summaries
+                        if r.get('error') or r.get('comparison_error') or not processed_result(r)]
+            raise RuntimeError('Some curves/plots failed validation or solver status is unresolved; '+
+                               ' | '.join(failures)+'; see STEP5_queue_status.json')
     finally:
+        if 'jobs' in locals() and hasattr(jobs, 'close'):
+            jobs.close()
         os.chdir(previous)
 
 
@@ -738,12 +1200,84 @@ def analysis_finished(directory, name):
     return completion_details(directory, name)['analysis_completed']
 
 
-def capacity_status(result):
+def postpeak_path_check(rows, displacement_key, ratio=.70):
+    """Screen for an apparent LPF drop that nearly retraces the pre-peak path.
+
+    This is a conservative warning, not a bifurcation/physical-collapse test.
+    A decreasing response alone is NOT rejected: genuine snap-back can do that.
+    Require agreement with the earlier rising path in every available active
+    end-response channel, to 1% of that channel's pre-peak excursion. No signs,
+    dimensions or geometry-specific loads are assumed and points are not moved.
+    """
+    hit = crossing([float(row['lpf']) for row in rows], ratio)
+    evidence = dict(policy='postpeak-path-v1', status='NO_LOAD_DROP',
+                    relative_path_tolerance=.01)
+    if not hit:
+        return evidence
+    peak_index = hit['peak_index']
+    evidence.update(status='NO_RETRACE_DETECTED', peak_index=peak_index,
+                    crossing_index=hit['index'])
+    rising = []
+    for row in rows[:peak_index+1]:
+        value = float(row['lpf'])
+        if value >= 0. and (not rising or value > float(rising[-1]['lpf'])):
+            rising.append(row)
+    if len(rising) < 4:
+        evidence['status'] = 'INSUFFICIENT_PATH_SAMPLES'
+        return evidence
+    post = rows[peak_index+1:hit['index']+1]
+    channels = list(dict.fromkeys((displacement_key, 'shortening_mm', 'rotation_mrad')))
+    # An unloaded conjugate displacement can have a small nonlinear geometric
+    # contraction; it must not control a pure-M or pure-P path comparison.
+    for load_key, response_key in (('force_kN', 'shortening_mm'), ('moment_kNm', 'rotation_mrad')):
+        if (response_key != displacement_key and all(row.get(load_key) not in (None, '') for row in rows)
+                and all(float(row[load_key]) == 0. for row in rows)):
+            channels.remove(response_key)
+    errors = {}
+    loads = [float(row['lpf']) for row in rising]
+    for key in channels:
+        if any(row.get(key) in (None, '') for row in rising+post):
+            continue
+        values = [float(row[key]) for row in rising]
+        span = max(values)-min(values)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError('Nonfinite pre-peak response: '+key)
+        if span <= 1e-12:
+            continue
+        deviations = []
+        for row in post:
+            value, response = float(row['lpf']), float(row[key])
+            if not math.isfinite(response) or not loads[0] <= value <= loads[-1]:
+                deviations.append(float('inf'))
+                continue
+            j = min(max(1, bisect.bisect_right(loads, value)), len(loads)-1)
+            fraction = (value-loads[j-1])/(loads[j]-loads[j-1])
+            reference = values[j-1]+fraction*(values[j]-values[j-1])
+            deviations.append(abs(response-reference)/span)
+        errors[key] = max(deviations)
+    if not errors or displacement_key not in errors:
+        evidence['status'] = 'INSUFFICIENT_PATH_SAMPLES'
+        return evidence
+    # JSON diagnostics must remain finite even for an out-of-range response.
+    evidence['relative_channel_errors'] = {key: value if math.isfinite(value) else None
+                                           for key, value in errors.items()}
+    if all(value <= .01 for value in errors.values()):
+        evidence['status'] = 'RETRACE_SUSPECTED'
+    return evidence
+
+
+def capacity_status(result, rows=None, axes=None):
     """Keep observed maxima, but never publish unverified maxima as Pu/Mu or P-M capacity."""
     verified = (bool(result.get('criterion_reached')) and
                 result.get('outcome') in ('CRITERION_REACHED', 'CONTROLLED_TERMINATION'))
+    if rows is not None and axes is not None:
+        result['postpeak_path_check'] = postpeak_path_check(
+            rows, axes['x'], float(result.get('postpeak_stop_ratio', .70)))
+    result['path_review_required'] = (result.get('postpeak_path_check') or {}).get('status') == 'RETRACE_SUSPECTED'
+    verified = verified and not result['path_review_required']
     result['capacity_verified'] = verified
-    result['peak_interpretation'] = 'VERIFIED_POSTPEAK' if verified else 'OBSERVED_MAXIMUM_ONLY'
+    result['peak_interpretation'] = ('PATH_REVIEW_REQUIRED' if result['path_review_required'] else
+                                     'VERIFIED_POSTPEAK' if verified else 'OBSERVED_MAXIMUM_ONLY')
     if not verified:
         for key in ('Pu_over_Py', 'Mu_over_My', 'Mu_over_Mp'):
             result.pop(key, None)
@@ -779,7 +1313,7 @@ def completed_curve(directory, name, info, ratio=.70, allow_incomplete=False, re
     # A plot exception recorded AFTER a valid outcome must not force another
     # solve. Revalidate the saved numerical curve, then repair plots from CSV.
     if result.get('outcome') not in ('CRITERION_REACHED','CONTROLLED_TERMINATION','CRITERION_NOT_REACHED',
-                                   'INCOMPLETE_ANALYSIS','SOLVER_STATUS_UNKNOWN','SOLVER_ERROR','PARTIAL_RESULT'):
+                                   'INCOMPLETE_ANALYSIS','SOLVER_STATUS_UNKNOWN','SOLVER_ERROR','PARTIAL_RESULT','TIME_LIMIT'):
         return None
     axes=fd.response_axes(info)
     stem=directory/(name+axes['stem']+('_partial' if result.get('partial') else ''))
@@ -787,6 +1321,16 @@ def completed_curve(directory, name, info, ratio=.70, allow_incomplete=False, re
     odb=directory/(name+'.odb')
     if (directory/(name+'.lck')).exists():
         raise ValueError('Job is locked/running: '+name)
+    if confirmed_time_limit(result) and result.get('curve_available') is False:
+        # Explicit omission, not a zero-capacity point or a reusable solved curve.
+        result.update(pm_point=None,capacity_verified=False)
+        return (result,[]) if allow_incomplete else None
+    if (result.get('outcome') == 'SOLVER_ERROR' and not result.get('curve_available') and
+            result.get('solver_exit_code') is None and
+            not any(path.exists() for path in (csv_path, stem.with_suffix('.json'), odb))):
+        # A scheduling/path failure can precede submission entirely. Reuse no
+        # curve and let the normal artifact/workspace guards validate a retry.
+        return None
     for path in (csv_path,stem.with_suffix('.json'),odb):
         if not path.is_file():
             raise ValueError('Missing completed result artifact: '+str(path))
@@ -843,7 +1387,11 @@ def completed_curve(directory, name, info, ratio=.70, allow_incomplete=False, re
     ykey=axes['y']
     if ykey in result and not math.isclose(float(result[ykey]),max(p[1] for p in points),rel_tol=1e-7,abs_tol=1e-8):
         raise ValueError('Saved peak differs from curve: '+name)
-    capacity_status(result)
+    previous_capacity = result.get('capacity_verified')
+    capacity_status(result, data, axes)
+    if previous_capacity != result['capacity_verified'] and result.get('path_review_required'):
+        # Recreate small queue reports on --resume, never rerun an occupied job.
+        result['completion_reassessed'] = True
     select_pm_result(result,info,data)
     return result,points
 
@@ -856,7 +1404,8 @@ def completion_details(directory, name, odb_status=None):
     diagnostic, and must still be justified by this job's recorded request/crossing.
     """
     evidence, diagnostics = [], []
-    for suffix in ('.sta', '.msg', '.log', '_queue_solver.log'):
+    preprocessing_failed = False
+    for suffix in ('.sta', '.msg', '.dat', '.log', '_queue_solver.log'):
         path = os.path.join(directory, name+suffix)
         if not os.path.isfile(path):
             continue
@@ -886,6 +1435,12 @@ def completion_details(directory, name, odb_status=None):
         if fatal:
             evidence.append((tag, 'FAILED'))
             diagnostics.append(tag+': '+fatal[0][:500].replace('\n',' '))
+            if suffix == '.dat' and not os.path.isfile(os.path.join(directory, name+'.sta')):
+                preprocessing_failed = True
+        if re.search(r'ANALYSIS INPUT FILE PROCESSOR EXITED WITH AN ERROR', text):
+            preprocessing_failed = True
+            evidence.append((tag, 'FAILED'))
+            diagnostics.append(tag+': Analysis Input File Processor exited with an error')
         if re.search(r'ABAQUS/ANALYSIS EXITED WITH ERRORS|ABAQUS JOB\s+'+re.escape(name.upper())+r'\s+ABORTED\b',text):
             evidence.append((tag, 'TERMINATED' if external else 'INCOMPLETE'))
     status = str(odb_status or '').upper()
@@ -909,11 +1464,13 @@ def completion_details(directory, name, odb_status=None):
         ('FAILED','TERMINATED','INCOMPLETE','COMPLETED','RUNNING') if s in states),'UNKNOWN')
     return dict(analysis_state=state, analysis_completed=state=='COMPLETED',
                 completion_sources=[source+':'+state for source,state in evidence],
-                completion_diagnostics=diagnostics)
+                completion_diagnostics=diagnostics, preprocessing_failed=preprocessing_failed)
 
 
 def curve_label(name, result):
     label = name.replace('STEP5_', '')
+    if result.get('path_review_required'):
+        return label+' (path retracing suspected; capacity unverified)'
     return label if result.get('capacity_verified') else label+' (capacity unverified: '+result.get('outcome','UNKNOWN')+')'
 
 
@@ -935,10 +1492,10 @@ def processed_result(result):
     even though its maximum cannot be published as capacity. Live/unknown jobs and
     missing or invalid curves never qualify through this continuation path.
     """
-    return finished_result(result) or (
+    return (confirmed_time_limit(result) and result.get('outcome')=='TIME_LIMIT') or finished_result(result) or (
         result.get('curve_available') is True and
         result.get('analysis_state') in ('FAILED','INCOMPLETE','TERMINATED','COMPLETED') and
-        result.get('outcome') in ('SOLVER_ERROR','INCOMPLETE_ANALYSIS','PARTIAL_RESULT'))
+        result.get('outcome') in ('SOLVER_ERROR','INCOMPLETE_ANALYSIS','PARTIAL_RESULT','TIME_LIMIT'))
 
 
 def select_pm_result(result,info,rows):
@@ -947,9 +1504,23 @@ def select_pm_result(result,info,rows):
         return result
     import abaqus_pm_interaction as pm
     axes=fd.response_axes(info)
-    terminal=bool(result.get('capacity_verified')) or result.get('analysis_state') in (
+    terminal=confirmed_time_limit(result) or bool(result.get('capacity_verified')) or result.get('analysis_state') in (
         'FAILED','INCOMPLETE','TERMINATED','COMPLETED')
-    selection=pm.select_response_point(rows,axes['x'],bool(result.get('capacity_verified')),terminal)
+    if axes['kind']=='combined':
+        selection=pm.select_pm_response_point(rows,bool(result.get('capacity_verified')),terminal)
+    else:
+        selection=pm.select_response_point(rows,axes['x'],bool(result.get('capacity_verified')),terminal)
+    event_selected=selection is not None and selection['selection_kind'] in (
+        'SIGNIFICANT_LOAD_DROP','SIGNIFICANT_STIFFNESS_CHANGE')
+    if (terminal and not event_selected and result.get('path_review_required') and
+            result.get('outcome') in ('CRITERION_REACHED', 'CONTROLLED_TERMINATION')):
+        # Retain the observed increment for display, with an explicit warning.
+        # This does not change the established policy for other unfinished rays.
+        selection = dict(selection or {},row=dict(max(rows, key=lambda row: float(row['lpf']))),
+                         selection_kind='UNVERIFIED_PATH_RETRACE', capacity_verified=False,
+                         provisional=True, selection_policy='response-v4-dual+postpeak-path-v1',
+                         selection_diagnostics=dict((selection or {}).get('selection_diagnostics',{}),
+                                                    postpeak_path_check=result['postpeak_path_check']))
     for key in PM_SUMMARY_FIELDS:result.pop(key,None)
     result['pm_point']=None
     if selection is None:
@@ -965,7 +1536,11 @@ def select_pm_result(result,info,rows):
                                                        rel_tol=1e-7,abs_tol=1e-8):
                 raise ValueError('Selected P-M component differs from synchronized LPF: '+key)
     point=pm_point(info,values)
-    point.update(selection,frame=int(raw['frame']),lpf=float(raw['lpf']),selection_response=axes['x'])
+    if result.get('path_review_required'):
+        selection['selection_diagnostics']['postpeak_path_check']=result['postpeak_path_check']
+        selection.update(capacity_verified=False,provisional=True)
+    selection.setdefault('selection_response',axes['x'])
+    point.update(selection,frame=int(raw['frame']),lpf=float(raw['lpf']))
     point['selection_diagnostics']=json.dumps(point['selection_diagnostics'],sort_keys=True,allow_nan=False)
     result['pm_point']=point
     result.update(pm_selection_kind=point['selection_kind'],pm_selection_frame=point['frame'],
@@ -993,13 +1568,16 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--run-dir',required=True)
     p.add_argument('--cae')
+    p.add_argument('--cufsm-report-dir', help='Built-up CUFSM report directory for plotting benchmarks')
     p.add_argument('--abaqus-cmd',default='abaqus',
                    help='Abaqus launcher name in PATH or full path; used for submission and termination')
     p.add_argument('--jobs',nargs='+')
     p.add_argument('--cpus',type=resources.cpu_request,default='auto',
-                   help="Abaqus CPUs per job: 'auto' (all physical cores) or a positive integer")
+                   help="Total solver CPU budget: auto (all physical cores) or a positive integer, shared between concurrent jobs")
+    p.add_argument('--parallel-jobs',type=parallel_request,default=1,
+                   help='Independent simultaneous solves: positive integer or auto (up to two); default 1')
     p.add_argument('--gpus',type=resources.gpu_request,default='auto',
-                   help="Abaqus GPUs per job: 'auto' (all visible) or an integer >= 0")
+                   help="Total GPUs: auto (all visible) or integer >= 0; one parallel slot owns them, others use CPU")
     p.add_argument('--ratio',type=float,default=.70)
     p.add_argument('--poll-seconds',type=float,default=1.0)
     p.add_argument('--progress-seconds',type=float,default=15.0,
@@ -1017,6 +1595,8 @@ def main():
     if not math.isfinite(args.progress_seconds) or args.progress_seconds <= 0:
         p.error('Progress interval must be finite and positive')
     args.run_dir=os.path.abspath(args.run_dir)
+    if args.cufsm_report_dir:
+        args.cufsm_report_dir=os.path.abspath(os.path.expanduser(args.cufsm_report_dir))
     if args.cae:
         args.cae=os.path.abspath(args.cae)
     run(args)

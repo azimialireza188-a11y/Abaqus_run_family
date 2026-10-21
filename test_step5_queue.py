@@ -9,6 +9,28 @@ from types import SimpleNamespace
 
 
 class QueueTests(unittest.TestCase):
+    def test_console_bridge_delivers_cae_messages_without_native_stdout(self):
+        import abaqus_step5_progress as progress
+        with tempfile.TemporaryDirectory(dir=__import__("pathlib").Path(__file__).parent) as directory:
+            output = io.StringIO()
+            with mock.patch.object(progress.sys, 'stdout', output):
+                with progress.console_bridge(directory, dict(os.environ)) as environment:
+                    self.assertEqual(environment['STEP5_REPORT_PYTHON'], os.path.abspath(__import__('sys').executable))
+                    with mock.patch.dict(os.environ, environment), mock.patch.object(progress.sys, 'stderr', io.StringIO()):
+                        progress.report('SOLVING', 'PM_TEST | increment=27 | LPF=0.8')
+            self.assertIn('PM_TEST | increment=27 | LPF=0.8', output.getvalue())
+
+    def test_live_reports_use_parent_python_after_persisting_queue_results(self):
+        q = self.queue()
+        with tempfile.TemporaryDirectory(dir=__import__("pathlib").Path(__file__).parent) as directory:
+            with mock.patch.dict(os.environ, {'STEP5_REPORT_PYTHON': r'C:\Python314\python.exe'}), mock.patch.object(q.subprocess, 'run') as child:
+                q.publish_response_reports(directory)
+            command = child.call_args.args[0]
+            self.assertEqual(command[:2], [r'C:\Python314\python.exe', '-B'])
+            self.assertIn('--publish-responses', command)
+            self.assertEqual(command[-1], directory)
+            self.assertTrue(child.call_args.kwargs['check'])
+
     def test_windows_core_detection_uses_topology_without_wmi_access(self):
         import ctypes, struct
         import runtime_resources as r
@@ -275,6 +297,135 @@ class QueueTests(unittest.TestCase):
             self.assertIn('PERFECT', s)
             self.assertIn('AsFy', s)
             self.assertTrue(os.path.getsize(os.path.join(d,'STEP5_all_force_displacement_combined.png')) > 1000)
+
+    def test_labelled_report_lines_in_comparison_svg_and_png(self):
+        q = self.queue()
+        import matplotlib.pyplot as plt
+        curves = [('Bending', [(0., 0.), (1., 3.)])]
+        refs = [{'value': 5., 'label': 'SFy report x'}, {'value': 7., 'label': 'ZFy report x'}]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(plt, 'close'):
+            path = os.path.join(directory, 'comparison')
+            q.plot_svg(path+'.svg', curves, refs, 'Bending', q.fd.RESPONSE_AXES['bending'])
+            with open(path+'.svg', encoding='utf-8') as stream:
+                svg = stream.read()
+            self.assertIn('SFy report x', svg)
+            self.assertIn('ZFy report x', svg)
+            q.plot_png(path+'.png', curves, refs, 'Bending', q.fd.RESPONSE_AXES['bending'])
+            ax = plt.gcf().axes[0]
+            report_lines = [line for line in ax.lines if 'report' in line.get_label()]
+            self.assertEqual([list(line.get_ydata()) for line in report_lines], [[5., 5.], [7., 7.]])
+            self.assertGreater(ax.get_ylim()[1], 7.)
+        plt.close('all')
+
+    def test_cae_fallback_keeps_labelled_horizontal_report_lines(self):
+        q = self.queue()
+        import builtins
+        original_import = builtins.__import__
+        def without_matplotlib(name, *args, **kwargs):
+            if name == 'matplotlib':
+                raise ImportError('exercise CAE fallback')
+            return original_import(name, *args, **kwargs)
+        chart = SimpleNamespace(setValues=mock.Mock(), autoColor=mock.Mock())
+        plot = SimpleNamespace(charts={'chart': chart}, title=SimpleNamespace(setValues=mock.Mock()))
+        session = SimpleNamespace(xyPlots={}, xyDataObjects={}, XYPlot=mock.Mock(return_value=plot),
+            XYData=mock.Mock(side_effect=lambda **kw: kw), Curve=mock.Mock(side_effect=lambda **kw: kw),
+            viewports={'view': SimpleNamespace(setValues=mock.Mock())},
+            printOptions=SimpleNamespace(setValues=mock.Mock()), pngOptions=SimpleNamespace(setValues=mock.Mock()),
+            printToFile=mock.Mock())
+        with mock.patch.object(builtins, '__import__', side_effect=without_matplotlib), mock.patch.dict('sys.modules', {
+                'abaqus': SimpleNamespace(session=session), 'abaqusConstants': SimpleNamespace(PNG='PNG', OFF=False),
+                'visualization': SimpleNamespace()}):
+            q.plot_png('unused.png', [('curve', [(0., 0.), (2., 3.)])],
+                       [{'value': 7., 'label': 'ZFy report built-up x'}], 'Bending', q.fd.RESPONSE_AXES['bending'])
+        reference = session.XYData.call_args_list[-1].kwargs
+        self.assertEqual(reference['data'], ((0., 7.), (2., 7.)))
+        self.assertEqual(reference['legendLabel'], 'ZFy report built-up x')
+
+    def test_report_lines_are_deduplicated_by_value_and_identity(self):
+        q = self.queue()
+        lines = [5.]
+        q.merge_capacity_lines(lines, [5., {'value': 5., 'label': 'SFy report'},
+                                       {'value': 7., 'label': 'ZFy report'}], q.fd.RESPONSE_AXES['bending'])
+        q.merge_capacity_lines(lines, [{'value': 7., 'label': 'ZFy report'}], q.fd.RESPONSE_AXES['bending'])
+        self.assertEqual(lines, [5., {'value': 5., 'label': 'SFy report'}, {'value': 7., 'label': 'ZFy report'}])
+
+    def test_queue_report_override_preserves_capacity_ratios_and_metadata(self):
+        import csv, json
+        import abaqus_report_reference as reader
+        q = self.queue()
+        reference = dict(schema='cufsm_builtup_reference_v1', AsFy_kN=1100., axes={
+            'x': dict(axis_deg=0., SFy_kNm=130., ZFy_kNm=190.),
+            'z': dict(axis_deg=90., SFy_kNm=140., ZFy_kNm=200.)})
+        with tempfile.TemporaryDirectory() as directory:
+            name = 'STEP5_B_FY240'
+            info = dict(stage=5, settings=dict(field_frequency=1, fy=240.),
+                        load_case=dict(type='bending'), bending_axis_deg=0.,
+                        reference_moment_Nmm=20e6, first_yield_moment_Nmm=20e6, end_area_mm2=1000.)
+            metadata_path = os.path.join(directory, name+'_step5.json')
+            original = json.dumps(info)
+            with open(metadata_path, 'w') as stream:
+                stream.write(original)
+            with open(os.path.join(directory, name+'.inp'), 'w') as stream:
+                stream.write('test input')
+            csv_path = os.path.join(directory, name+'_moment_rotation.csv')
+            with open(csv_path, 'w', newline='') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['rotation_mrad', 'moment_kNm', 'lpf'])
+                writer.writerows([(0., 0., 0.), (1., 50., 1.), (2., 25., .5)])
+            summary = dict(csv=csv_path, peak=dict(moment_kNm=50., rotation_mrad=1., lpf=1.), partial=False)
+            args = SimpleNamespace(run_dir=directory, jobs=[name], cae=None, cpus=1, gpus=0,
+                                   extract_only=True, repair_only=False, ratio=.7, stop_method='monitor',
+                                   cufsm_report_dir='report-folder')
+            completed = dict(analysis_completed=True, analysis_state='COMPLETED', completion_diagnostics=[],
+                             completion_sources=['test'])
+            with mock.patch.object(reader, 'read_reference', return_value=reference) as read, \
+                    mock.patch.object(q.resources, 'detect_resources'), \
+                    mock.patch.object(q.resources, 'resolve_solver_policy', return_value=SimpleNamespace(cpus=1, gpus=0)), \
+                    mock.patch.object(q, 'completion_details', return_value=completed), \
+                    mock.patch.object(q.fd, 'extract', return_value=summary) as extract, \
+                    mock.patch.object(q, 'plot_png') as plot, mock.patch.object(q, 'write_comparison') as compare, \
+                    mock.patch.object(q, 'report'):
+                q.run(args)
+            read.assert_called_once_with('report-folder', fy=240.)
+            self.assertEqual(extract.call_args.args[0].cufsm_report_dir, 'report-folder')
+            self.assertEqual([line['value'] for line in plot.call_args.args[2]], [130., 190.])
+            result = compare.call_args.args[3][0]
+            self.assertEqual(result['My_kNm'], 20.)
+            self.assertEqual(result['Mu_over_My'], 2.5)
+            self.assertEqual(compare.call_args.kwargs['report_reference'], reference)
+            with open(metadata_path) as stream:
+                self.assertEqual(stream.read(), original)
+
+    def test_resumed_saved_curves_receive_report_lines_without_extraction(self):
+        import json
+        import abaqus_report_reference as reader
+        q = self.queue()
+        reference = dict(schema='cufsm_builtup_reference_v1', AsFy_kN=1100., axes={})
+        with tempfile.TemporaryDirectory() as directory:
+            name = 'STEP5_D_FY240'
+            info = dict(stage=5, settings=dict(field_frequency=1, fy=240.),
+                        reference_force_N_per_end=240000., end_area_mm2=1000.)
+            for filename, content in ((name+'.inp', 'test input'), (name+'_step5.json', json.dumps(info))):
+                with open(os.path.join(directory, filename), 'w') as stream:
+                    stream.write(content)
+            saved = dict(model=name, outcome='CRITERION_REACHED', peak_interpretation='verified',
+                         criterion_reached=True, analysis_completed=True, analysis_state='COMPLETED')
+            args = SimpleNamespace(run_dir=directory, jobs=[name], cae=None, cpus=1, gpus=0,
+                                   extract_only=False, repair_only=False, resume=True, ratio=.7,
+                                   stop_method='monitor', cufsm_report_dir='report-folder')
+            with mock.patch.object(reader, 'read_reference', return_value=reference), \
+                    mock.patch.object(q.resources, 'detect_resources'), \
+                    mock.patch.object(q.resources, 'resolve_solver_policy', return_value=SimpleNamespace(cpus=1, gpus=0)), \
+                    mock.patch.object(q, 'validate_submission'), \
+                    mock.patch.object(q, 'completed_curve', return_value=(saved, [(0., 0.), (1., 200.)])), \
+                    mock.patch.object(q.fd, 'extract') as extract, mock.patch.object(q, 'run_job') as solve, \
+                    mock.patch.object(q, 'plot_png') as png, mock.patch.object(q, 'plot_svg') as svg, \
+                    mock.patch.object(q, 'write_comparison'), mock.patch.object(q, 'report'):
+                q.run(args)
+            extract.assert_not_called()
+            solve.assert_not_called()
+            self.assertEqual(png.call_args.args[2][0]['value'], 1100.)
+            self.assertEqual(svg.call_args.args[2][0]['value'], 1100.)
 
     def test_sta_riks_parser_skips_unconverged_attempts(self):
         q=self.queue()

@@ -10,7 +10,7 @@ LG_mp=-0.34t,0,L/1000 and postpeak ratio=0.70. Member fy defaults to 240 MPa.
 Compression is the default. --load-case bending --bending-axis-deg ANGLE uses
 the existing bending load definition, twist-free REF_G and a lateral eigenmode;
 its run folders and moment-rotation comparisons carry a separate BEND angle tag.
-Step5 includes its default PERFECT baseline and the single LG_mp imperfect case.
+Step5 defaults to PERFECT and LG_mp; --model-cases selects both or one nonlinear case.
 Completed families update STEP5_family_force_displacement.svg (and PNG when
 matplotlib is available): PERFECT solid, LG_mp dashed, one color per family.
 """
@@ -37,7 +37,7 @@ REPO_FILES = ('abaqus_complete_model_m20.py', 'gdlc_classifier/gdlc_mode_decompo
               'abaqus_step5_queue_nogui.py', 'step5_progress_tail.ps1',
               'runtime_resources.py', 'abaqus_pipeline_contract.py')
 REPO_DEPENDENCIES = ('abaqus_step5_queue.py', 'abaqus_step5_force_displacement_core.py',
-    'abaqus_step5_progress.py', 'abaqus_load_case.py', 'gdlc_classifier/abaqus_mfsm_export.py',
+    'abaqus_step5_progress.py', 'abaqus_load_case.py', 'abaqus_report_reference.py', 'gdlc_classifier/abaqus_mfsm_export.py',
     'gdlc_classifier/gdlc_stiffness.py')
 EXPECTED_JOBS = {'STEP5_PERFECT_FY240', 'STEP5_LG_mp_FY240'}
 # '_REF1': supplied working reference loading/supports. Older Step5/P-M
@@ -46,6 +46,16 @@ STEP5_DIRECTORY = 'Step5_GMNIA_FY240_LG_'+STEP5_END_TAG
 STEP4_RECEIPT = 'family_pipeline_step4.json'
 STEP5_SETTINGS = dict(fy=240., initial_arc=.01, min_arc=1e-8, max_arc=.05,
                      max_increments=5000, field_frequency=1, postpeak_stop_ratio=.70)
+
+
+def riks_build_arguments(args):
+    from abaqus_step5_gmnia import riks_controls_profile
+    return ['--riks-controls', riks_controls_profile(getattr(args, 'riks_controls', 'auto'))]
+
+
+def validate_riks_profile(args, info, match=True):
+    from abaqus_step5_gmnia import riks_controls_profile
+    return riks_controls_profile(getattr(args, 'riks_controls', 'auto') if match else 'auto', info.get('settings', {}))
 
 
 def step5_settings(args):
@@ -58,15 +68,26 @@ def column_fy_tag(args):
 
 
 def expected_jobs(args):
-    return {'STEP5_'+case+'_FY'+column_fy_tag(args) for case in ('PERFECT','LG_mp')}
+    return {'STEP5_'+model.removeprefix('STEP4_')+'_FY'+column_fy_tag(args) for model in selected_models(args)}
+
+
+def selected_models(args):
+    selection=getattr(args,'model_cases','both')
+    return {'both':['PERFECT','STEP4_LG_mp'],
+            'perfect':['PERFECT'],'imperfect':['STEP4_LG_mp']}[selection]
+
+
+def model_case_suffix(selection):
+    return '' if selection=='both' else '_'+selection.upper()+'_ONLY'
 
 
 def default_step5_directory(args):
-    return 'Step5_GMNIA_FY'+column_fy_tag(args)+'_LG_'+STEP5_END_TAG
+    return 'Step5_GMNIA_FY'+column_fy_tag(args)+'_LG_'+STEP5_END_TAG+model_case_suffix(getattr(args,'model_cases','both'))
 
 
 def pm_directory(args):
-    return 'Step5_PM_FY'+column_fy_tag(args)+'_LG_'+STEP5_END_TAG
+    return (getattr(args,'pm_directory',None) or
+            'Step5_PM_FY'+column_fy_tag(args)+'_LG_'+STEP5_END_TAG+model_case_suffix(getattr(args,'model_cases','both')))
 
 
 def check_end_condition(info, name):
@@ -158,13 +179,24 @@ def parse_arguments(argv=None):
         help='Added connector/cross plate yield stress (MPa); default 360, independent of column steel')
     parser.add_argument('--steel-column-plate-fy',type=float,default=240.,
         help='Column wall yield stress (MPa); default 240, passed to Step5/P-M as --fy')
+    parser.add_argument('--cufsm-report-dir',type=Path,
+        help='Optional legacy report override; default: calculate gross four-piece A/S/Z from family geometry')
     parser.add_argument('--pm-interaction',action='store_true',help='Also build/solve existing P-M rays and collect diagrams per family/configuration')
+    parser.add_argument('--pm-only',action='store_true',
+        help='Build/solve only P-M nonlinear rays; keep original/reference/Step4 preparation and skip standalone Step5')
+    parser.add_argument('--model-cases',choices=('both','perfect','imperfect'),default='both',
+        help='Nonlinear Step5 and P-M cases: both (default), PERFECT only, or LG_mp only; reference preparation stays shared')
     parser.add_argument('--pm-axes',default='required',help='P-M neutral axes: required, all, or comma-separated degrees')
-    parser.add_argument('--pm-angles',default='0,15,30,45,60,75,90',help='P-M proportional ray angles in [0,90] degrees')
+    parser.add_argument('--pm-angles',default='0,15,30,45,60,75,90',
+        help='P-M load-ray angles, not bending axes: 0=only axial, 90=only bending; include intermediate angles for an envelope')
+    parser.add_argument('--pm-directory',
+        help='P-M folder under imperfection; select a fresh name for a changed ray set while --resume reuses primary stages')
     parser.add_argument('--n-modes', type=positive_int, default=250)
     parser.add_argument('--n-vectors', type=positive_int, default=500)
     parser.add_argument('--max-iterations', type=positive_int, default=1250)
     parser.add_argument('--cpus', type=cpu_request, default='auto')
+    parser.add_argument('--parallel-jobs',type=cpu_request,default='1',
+        help='Concurrent nonlinear jobs: auto or a positive count; --cpus is the shared total CPU budget')
     parser.add_argument('--buckle-output', choices=('standard', 'detailed'), default='detailed')
     parser.add_argument('--nodal-precision', choices=('single', 'full'), default='full')
     parser.add_argument('--longitudinal-lines', type=int, default=4)
@@ -175,6 +207,8 @@ def parse_arguments(argv=None):
         help='Neutral-axis angle from global X; 0 means compression on the +Y side')
     parser.add_argument('--global-modes', default=None,
         help='REF_G modes: default 1, retaining the first eigenmode including torsion; an explicit pair must be degenerate')
+    parser.add_argument('--riks-controls', choices=('auto','default','robust'), default='auto',
+        help='Auto: bounded Newton controls for new inputs; keep recorded controls on resume')
     parser.add_argument('--riks-extrapolation', choices=('linear','none'), default='linear',
         help='Step5 Riks predictor (linear preserves the existing default; none disables extrapolation)')
     parser.add_argument('--step5-directory', default=None,
@@ -184,6 +218,7 @@ def parse_arguments(argv=None):
     parser.add_argument('--start-family',
         help='Start at this existing family folder (e.g. family_5); earlier families are left untouched')
     args = parser.parse_args(argv)
+    if args.pm_only:args.pm_interaction=True
     if not math.isfinite(args.steel_column_plate_fy) or args.steel_column_plate_fy<=0:
         parser.error('--steel-column-plate-fy must be finite and positive')
     if args.step5_directory is None:args.step5_directory=default_step5_directory(args)
@@ -205,6 +240,8 @@ def parse_arguments(argv=None):
             angles=sorted(set(pm.parse_float_list(args.pm_angles,'--pm-angles')))
             if any(not 0.<=v<=90. for v in angles):raise ValueError('--pm-angles must be in [0,90]')
             args.pm_angles=','.join('%g'%v for v in angles)
+            warning=pm.ray_sampling_warning(angles)
+            if warning:print(warning,flush=True)
             if args.pm_axes not in ('required','all'):
                 axes=[loads.normalize_angle(v) for v in pm.parse_float_list(args.pm_axes,'--pm-axes')]
                 if len(set(axes))!=len(axes):raise ValueError('duplicate P-M axes')
@@ -219,6 +256,8 @@ def parse_arguments(argv=None):
         args.global_modes='1'
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', args.step5_directory):
         parser.error('--step5-directory must be a single alphanumeric folder name (underscores/hyphens allowed)')
+    if args.pm_directory is not None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*',args.pm_directory):
+        parser.error('--pm-directory must be a single alphanumeric folder name (underscores/hyphens allowed)')
     if args.longitudinal_lines != 0 and not 2 <= args.longitudinal_lines <= 100:
         parser.error('--longitudinal-lines must be 0 or an integer from 2 to 100')
     if not math.isfinite(args.mesh_mm) or args.mesh_mm <= 0:
@@ -239,7 +278,30 @@ def parse_arguments(argv=None):
         parser.error('Selected reference mode numbers must be <= 20 (--reference-modes is fixed at 20)')
     for name in ('family_root', 'output_root', 'repo'):
         setattr(args, name, getattr(args, name).expanduser().resolve())
+    args.report_reference=None
+    if args.cufsm_report_dir is not None:
+        from abaqus_report_reference import read_reference
+        args.cufsm_report_dir=args.cufsm_report_dir.expanduser().resolve()
+        try:args.report_reference=read_reference(args.cufsm_report_dir,fy=args.steel_column_plate_fy)
+        except (OSError,ValueError) as error:parser.error('--cufsm-report-dir: '+str(error))
     return args
+
+
+def family_reference_args(args, family):
+    """Keep automatic geometry references local to each independent family."""
+    supplied = getattr(args,'report_reference',None)
+    if (getattr(args,'cufsm_report_dir',None) or
+            supplied and supplied.get('schema') not in ('model_builtup_reference_v1','model_builtup_reference_v2')):
+        return args
+    from abaqus_report_reference import read_family_reference
+    local = copy.copy(args)
+    local.report_reference = read_family_reference(family,fy=args.steel_column_plate_fy)
+    return local
+
+
+def report_arguments(args):
+    directory=getattr(args,'cufsm_report_dir',None)
+    return ['--cufsm-report-dir',directory] if directory is not None else []
 
 
 def require_file(path):
@@ -415,6 +477,18 @@ def check_resume_build(args, family, run):
     output=cae.parent/getattr(args,'step5_directory',STEP5_DIRECTORY)
     if cae.parent.is_dir() and any(cae.parent.rglob('*.lck')):
         raise ValueError('--resume imperfection job/database is locked/running: '+str(run))
+    if getattr(args,'pm_only',False) and cae.exists():
+        checkpoint=cae.parent/STEP4_RECEIPT
+        if checkpoint.is_file():
+            if read_json(checkpoint) != step4_receipt(args,family,run):
+                raise ValueError('--resume Step4 settings/source files differ: '+str(cae))
+        else:
+            # Legacy delivery can establish Step4 provenance through its sidecars.
+            # Its completed/failed standalone capacity is irrelevant to a P-M-only run.
+            legacy=output if output.exists() else cae.parent/default_step5_directory(args)
+            check_step5_inputs(args,run,output=legacy,match_predictor=False,match_controls=False)
+        progress['step4']=True
+        return progress
     if output.exists():
         require_file(cae)
         infos=check_step5_inputs(args,run)
@@ -429,15 +503,21 @@ def check_resume_build(args, family, run):
         progress.update(step4=True,step5=True,completed=clean and (output/'STEP5_peak_summary.csv').is_file(),entries=entries)
     elif cae.exists():
         previous=cae.parent/default_step5_directory(args)
-        if output != previous and previous.is_dir():
+        previous_delivered=((previous/('Step5_GMNIA_FY'+column_fy_tag(args)+'.cae')).is_file()
+                            and (previous/'run_step5_queue_70_pct.bat').is_file())
+        if output != previous and previous.is_dir() and previous_delivered:
             # Verify the existing delivered input/provenance, not its failed
             # capacity. Only the fresh attempt may use a different predictor.
-            infos=check_step5_inputs(args,run,output=previous,match_predictor=False)
+            infos=check_step5_inputs(args,run,output=previous,match_predictor=False,match_controls=False)
             from abaqus_step5_queue import completed_curve
             entries={name:completed_curve(previous,name,info) for name,info in infos.items()}
-            if all(entry is not None and not entry[0].get('error') and
+            from abaqus_step5_gmnia import riks_controls_profile
+            requested_controls = riks_controls_profile(getattr(args, 'riks_controls', 'auto'))
+            same_controls = all(info.get('settings', {}).get('riks_controls', 'default') == requested_controls
+                                for info in infos.values())
+            if same_controls and all(entry is not None and not entry[0].get('error') and
                    not entry[0].get('comparison_error') for entry in entries.values()):
-                progress.update(step4=True,completed=True,entries=entries)
+                progress.update(step4=True,completed=True,entries=entries,step5_output=previous)
                 return progress
             progress['step4']=True
             return progress
@@ -549,14 +629,15 @@ def step4_receipt(args,family,run,include_cae=True):
     return receipt
 
 
-def check_step5_inputs(args,run,output=None,match_predictor=True):
+def check_step5_inputs(args,run,output=None,match_predictor=True,match_controls=True):
     """Validate delivered inputs and embedded Step4 provenance without opening a CAE."""
     args=family_args(args,run)
     output=output or run/'imperfection'/getattr(args,'step5_directory',STEP5_DIRECTORY)
     require_file(output/('Step5_GMNIA_FY'+column_fy_tag(args)+'.cae'))
     require_file(output/'run_step5_queue_70_pct.bat')
     if {p.stem for p in output.glob('*.inp')} != expected_jobs(args):
-        raise ValueError('Expected exactly PERFECT and LG_mp Step5 inputs: '+str(output))
+        raise ValueError('Step5 inputs differ from selected --model-cases (%s): %s; use a fresh --step5-directory'
+                         %(getattr(args,'model_cases','both'),output))
     state=read_json(run/'pipeline_status.json');job=state['build']['job_name']
     check_load_case(args,state['build'].get('load_case') or {},str(run))
     # Delivered STEP5 INPs are immutable solver inputs. The original CAE is no
@@ -585,6 +666,7 @@ def check_step5_inputs(args,run,output=None,match_predictor=True):
         if plates and (settings.get('steel_plate_fy')!=args.steel_plate_fy or
                 info.get('plastic_tables',{}).get(plates['material'])!=[[args.steel_plate_fy,0.]]):
             raise ValueError('--resume plate material differs: '+name)
+        validate_riks_profile(args, info, match=match_controls)
         predictor=settings.get('riks_extrapolation','linear')
         if predictor not in ('linear','none') or (match_predictor and predictor != args.riks_extrapolation):
             raise ValueError('--resume Step5 Riks extrapolation differs: '+name)
@@ -632,7 +714,7 @@ def check_step5_inputs(args,run,output=None,match_predictor=True):
     return infos
 
 
-def update_family_plot(batch_root,plans,finished,selection_suffix='',load_case='compression',bending_axis_deg=0.,configuration_label=None,column_fy=240.):
+def update_family_plot(batch_root,plans,finished,selection_suffix='',load_case='compression',bending_axis_deg=0.,configuration_label=None,column_fy=240.,report_reference=None,model_cases='both'):
     """Read each finished family's curves once; redraw only the shared small figure."""
     from abaqus_step5_queue import plot_svg,plot_png,fd
     import importlib.util
@@ -643,28 +725,69 @@ def update_family_plot(batch_root,plans,finished,selection_suffix='',load_case='
         color='#' + ''.join('%02x'%round(v*255) for v in rgb)
         tag=('%g'%column_fy).replace('.','p').replace('+','')
         for name,label,dash in (('STEP5_PERFECT_FY'+tag,'PERFECT',''),('STEP5_LG_mp_FY'+tag,'LG_mp','8 5')):
+            if name not in finished[family.name]:continue
             result, points = finished[family.name][name]
+            if not points:continue  # Explicit time-limit omission has no response curve.
             if not result.get('capacity_verified',result.get('criterion_reached')):
                 label += ' (capacity unverified: '+result.get('outcome','UNKNOWN')+')'
             curves.append((family.name+' '+label,points))
             styles.append(dict(color=color,dash=dash))
     if not curves:return
-    title='Family comparison - PERFECT (solid), LG_mp (dashed)'
+    title='Family comparison - '+{'both':'PERFECT (solid), LG_mp (dashed)',
+        'perfect':'PERFECT (solid)','imperfect':'LG_mp (dashed)'}[model_cases]
     if configuration_label:title+=' | '+configuration_label
     axes=fd.RESPONSE_AXES[load_case]
+    reference_lines=fd.capacity_lines(dict(load_case=dict(type=load_case),bending_axis_deg=bending_axis_deg,
+        settings=dict(fy=column_fy),report_reference=report_reference)) if report_reference else []
     tag=loads.load_case_tag(load_case,bending_axis_deg)
     fy_suffix=('_FY'+('%g'%column_fy).replace('.','p').replace('+','')) if column_fy!=240. else ''
-    stem=batch_root/('STEP5_family'+axes['stem']+tag+fy_suffix+selection_suffix)
+    stem=batch_root/('STEP5_family'+axes['stem']+tag+fy_suffix+selection_suffix+model_case_suffix(model_cases))
     # Replace only after rendering succeeds, so an interrupted render keeps the last figure.
     for ext,writer in (('.svg',plot_svg),('.png',plot_png)):
         if ext=='.png' and importlib.util.find_spec('matplotlib') is None:continue
         temporary=stem.with_name(stem.name+'.pending'+ext)
         try:
-            writer(str(temporary),curves,[],title,axes,styles=styles)
+            writer(str(temporary),curves,reference_lines,title,axes,styles=styles)
             os.replace(temporary,stem.with_suffix(ext))
         finally:
             if temporary.exists():temporary.unlink()
     print('COMPARISON UPDATED: '+str(stem.with_suffix('.svg')),flush=True)
+
+
+def refresh_step5_reference_plots(args,run,progress):
+    """Render saved responses with new benchmarks; keep solver files and curve data intact."""
+    reference=getattr(args,'report_reference',None)
+    if reference is None:return
+    from abaqus_step5_queue import fd,plot_svg,plot_png,merge_capacity_lines
+    import importlib.util
+    directory=progress.get('step5_output',run/'imperfection'/args.step5_directory)
+    curves,lines=[],[]
+    axes=None
+    def render(stem,curves,lines,title,axes):
+        for extension,writer in (('.svg',plot_svg),('.png',plot_png)):
+            if extension=='.png' and importlib.util.find_spec('matplotlib') is None:continue
+            destination=directory/(stem+extension)
+            temporary=destination.with_name(destination.stem+'.pending'+extension)
+            try:
+                writer(str(temporary),curves,lines,title,axes)
+                os.replace(temporary,destination)
+            finally:
+                if temporary.exists():temporary.unlink()
+    for name,(result,points) in sorted(progress['entries'].items()):
+        if not points:continue
+        info=dict(read_json(directory/(name+'_step5.json')),report_reference=reference)
+        axes=fd.response_axes(info)
+        benchmarks=fd.capacity_lines(info)
+        label=name
+        if not result.get('capacity_verified',result.get('criterion_reached')):
+            label+=' (capacity unverified: '+result.get('outcome','UNKNOWN')+')'
+        curve=(label,points)
+        stem=name+axes['stem']+('_partial' if result.get('partial') else '')
+        render(stem,[curve],benchmarks,label+' - '+axes['title'],axes)
+        curves.append(curve)
+        merge_capacity_lines(lines,benchmarks,axes)
+    if curves:render(axes['combined'],curves,lines,axes['combined_title'],axes)
+    print('STEP5 REFERENCE PLOTS UPDATED: '+str(directory),flush=True)
 
 
 def preflight(args):
@@ -696,9 +819,11 @@ def preflight(args):
         raise ValueError('Batch output is not a directory: '+str(batch_root))
     plans = []
     destinations=set()
+    base_args = args
     for family in families:
         for filename in INPUT_FILES:
             require_file(family/filename)
+        args = family_reference_args(base_args,family)
         run = batch_root/family_run_name(args,family)
         targets=(run,Path(str(run)+'_REF_L'),Path(str(run)+'_REF_G'))
         if any(target in destinations for target in targets):
@@ -739,7 +864,9 @@ def run_command(command, cwd, label, repo=None):
     if existing:
         module_paths.append(existing)
     environment['PYTHONPATH'] = os.pathsep.join(module_paths)
-    subprocess.run(command, cwd=str(cwd), check=True, env=environment)
+    from abaqus_step5_progress import console_bridge
+    with console_bridge(cwd, environment) as environment:
+        subprocess.run(command, cwd=str(cwd), check=True, env=environment)
 
 
 PM_DIRECTORY='Step5_PM_FY240_LG_'+STEP5_END_TAG
@@ -747,15 +874,20 @@ PM_RECEIPT='family_pipeline_pm.json'
 
 
 def pm_request(args,family,run):
-    return dict(step4=step4_receipt(args,family,run,include_cae=False),
+    request=dict(step4=step4_receipt(args,family,run,include_cae=False),
                 axes=args.pm_axes,angles=args.pm_angles,settings=step5_settings(args),
                 riks_extrapolation=args.riks_extrapolation,
                 steel_plate_fy=args.steel_plate_fy if args.steel_plate_length else None)
+    # Historical receipts without this key mean the original two-case workflow.
+    if getattr(args,'model_cases','both')!='both':request['models']=selected_models(args)
+    return request
 
 
 def pm_input_record(output,request):
     import abaqus_pm_interaction as pm
     manifest=read_json(output/pm.MANIFEST_FILE)
+    if 'models' in request and manifest.get('cases')!=request['models']:
+        raise ValueError('P-M manifest differs from selected models: '+str(output))
     jobs=[row['job'] for row in manifest.get('jobs',[])]
     if (manifest.get('mode')!='gmnia' or not jobs or len(set(jobs))!=len(jobs)
             or set(jobs)!={p.stem for p in output.glob('PM_*.inp')}
@@ -776,10 +908,19 @@ def pm_input_record(output,request):
     return dict(request=request,files=hashes)
 
 
-def pm_plot_current(output,record):
+def report_plot_signature(reference):
+    if reference is None:return None
+    return hashlib.sha256(json.dumps(reference,sort_keys=True,separators=(',',':'),
+                                    ensure_ascii=True).encode('ascii')).hexdigest()
+
+
+def pm_plot_current(output,record,report_reference=None):
+    from abaqus_pm_interaction import PLOT_VERSION
     points=output/'STEP5_PM_points.csv'
     return (points.is_file() and (output/'diagram'/'PM_interaction_points.csv').is_file()
             and record.get('plot_source_sha256')==file_sha256(points)
+            and record.get('plot_reference_sha256')==report_plot_signature(report_reference)
+            and record.get('plot_version')==PLOT_VERSION
             and bool(record.get('plot_files'))
             and all((output/'diagram'/name).is_file() for name in record['plot_files']))
 
@@ -791,8 +932,11 @@ def check_pm_resume(args,family,run):
     if not args.resume:raise ValueError('P-M output already exists: '+str(output))
     receipt=read_json(output/PM_RECEIPT)
     record=pm_input_record(output,pm_request(args,family,run))
+    for metadata in output.glob('PM_*_step5.json'):
+        validate_riks_profile(args, read_json(metadata))
     if any(receipt.get(key)!=value for key,value in record.items()):
-        raise ValueError('--resume P-M settings, provenance or inputs differ: '+str(output))
+        raise ValueError('--resume P-M settings, provenance or inputs differ: '+str(output)+
+                         '. For changed axes/rays, use a fresh --pm-directory; existing results are preserved.')
     from abaqus_step5_queue import completed_curve
     entries={name:completed_curve(output,name,read_json(path),allow_incomplete=True)
              for path in sorted(output.glob('PM_*_step5.json'))
@@ -809,7 +953,7 @@ def check_pm_resume(args,family,run):
                         all(processed_result(row) and not row.get('error') and not row.get('comparison_error')
                             for row in results))
     return dict(record=receipt,queue_completed=queue_complete,
-                completed=queue_complete and pm_plot_current(output,receipt))
+                completed=queue_complete and pm_plot_current(output,receipt,getattr(args,'report_reference',None)))
 
 
 def run_family_pm(args,family,run,abaqus,runner,prefix,state=None):
@@ -820,6 +964,7 @@ def run_family_pm(args,family,run,abaqus,runner,prefix,state=None):
     state=state if state is not None else check_pm_resume(args,family,run)
     if state and state['completed']:
         print('REUSE COMPLETED P-M: '+str(output),flush=True)
+        print('P-M DIAGRAM: '+str(output/'diagram'/'PM_interaction.png'),flush=True)
         return
     def invoke(command,stage,cwd=run):
         values=[str(value) for value in command]
@@ -830,17 +975,20 @@ def run_family_pm(args,family,run,abaqus,runner,prefix,state=None):
         invoke([abaqus,'cae','noGUI='+str(args.repo/'abaqus_pm_interaction.py'),'--',
                 '--mode','gmnia','--source-cae',run/'imperfection'/'Step4_LG.cae',
                 '--output-dir',output,'--axes',args.pm_axes,'--pm-angles',args.pm_angles,
-                '--models','PERFECT','STEP4_LG_mp','--fy',step5_settings(args)['fy'],'--cpus',args.cpus,
+                '--models',*selected_models(args),'--fy',step5_settings(args)['fy'],'--cpus',args.cpus,
+                *report_arguments(args),
                 *(['--steel-plate-fy',args.steel_plate_fy] if args.steel_plate_length else []),
                 '--initial-arc','.01','--min-arc','1e-8','--max-arc','.05',
                 '--max-increments','5000','--field-frequency','1','--postpeak-stop-ratio','.70',
-                '--riks-extrapolation',args.riks_extrapolation],'P-M BUILD')
+                '--riks-extrapolation',args.riks_extrapolation,*riks_build_arguments(args)],'P-M BUILD')
         record=pm_input_record(output,request)
         (output/PM_RECEIPT).write_text(json.dumps(record,indent=2),encoding='utf-8')
     else:record=state['record']
     command=[abaqus,'cae','noGUI='+str(args.repo/'abaqus_step5_queue_nogui.py'),'--',
              '--run-dir',output,'--cpus',args.cpus,'--gpus','auto','--ratio','.70',
-             '--stop-method','monitor','--abaqus-cmd',abaqus]
+             '--stop-method','monitor','--abaqus-cmd',abaqus,
+             '--parallel-jobs',getattr(args,'parallel_jobs','1')]
+    command.extend(report_arguments(args))
     if args.resume:command.append('--resume')
     if not state or not state.get('queue_completed'):
         invoke(command,'P-M SOLVE QUEUE',cwd=output)
@@ -851,15 +999,24 @@ def run_family_pm(args,family,run,abaqus,runner,prefix,state=None):
             any(row.get('error') or row.get('comparison_error') or not processed_result(row) for row in results)):
         raise RuntimeError('P-M queue/results could not be verified: '+str(output))
     points=require_file(output/'STEP5_PM_points.csv')
-    if not pm_plot_current(output,record):
+    reference=getattr(args,'report_reference',None)
+    if not pm_plot_current(output,record,reference):
         diagram=output/'diagram'
         invoke([sys.executable,args.repo/'abaqus_pm_interaction.py','--mode','collect',
-                '--roots',output,'--output-dir',diagram,'--fy',step5_settings(args)['fy']],'P-M DIAGRAM')
+                '--roots',output,'--output-dir',diagram,'--fy',step5_settings(args)['fy'],
+                *report_arguments(args)],'P-M DIAGRAM')
         require_file(diagram/'PM_interaction_points.csv')
         plots=sorted(path.name for path in diagram.glob('PM_interaction*.svg'))
         if not plots:raise RuntimeError('P-M diagrams missing; matplotlib is required: '+str(diagram))
-        record.update(plot_source_sha256=file_sha256(points),plot_files=plots)
+        plots += sorted(path.relative_to(diagram).as_posix() for path in
+                        (diagram/'response_curves').rglob('*_axial_bending_response.*')
+                        if path.suffix in ('.png','.svg','.xlsx'))
+        if (diagram/'PM_model_response_plots.json').is_file():
+            plots.append('PM_model_response_plots.json')
+        record.update(plot_source_sha256=file_sha256(points),plot_files=plots,
+                      plot_reference_sha256=report_plot_signature(reference),plot_version=pm.PLOT_VERSION)
         (output/PM_RECEIPT).write_text(json.dumps(record,indent=2),encoding='utf-8')
+    print('P-M DIAGRAM: '+str(output/'diagram'/'PM_interaction.png'),flush=True)
 
 
 def run_pipeline(args, runner=run_command, abaqus=None, _plans=None):
@@ -877,7 +1034,10 @@ def run_pipeline(args, runner=run_command, abaqus=None, _plans=None):
     plans = preflight(args) if _plans is None else _plans
     requested_launcher = getattr(args, 'abaqus_cmd', 'abaqus')
     abaqus = abaqus or shutil.which(requested_launcher)
-    if not abaqus and any(not progress.get('completed') or getattr(args,'pm_interaction',False) and not (progress.get('pm_state') or {}).get('queue_completed') for _,_,progress in plans):
+    pm_only=getattr(args,'pm_only',False)
+    if not abaqus and any((not progress.get('step4') if pm_only else not progress.get('completed')) or
+            getattr(args,'pm_interaction',False) and not (progress.get('pm_state') or {}).get('queue_completed')
+            for _,_,progress in plans):
         raise ValueError('Abaqus launcher not found: %s. Set --abaqus-cmd to its full path, '
                          'or use a terminal where abaqus works.' % requested_launcher)
     if abaqus:
@@ -889,18 +1049,32 @@ def run_pipeline(args, runner=run_command, abaqus=None, _plans=None):
     print('OUTPUT: '+str(batch_root), flush=True)
     print('COLUMN MATERIAL: fy = %g MPa'%step5_settings(args)['fy'],flush=True)
     if args.steel_plate_length:print('PLATE MATERIAL: F\'y = %g MPa'%args.steel_plate_fy,flush=True)
-    finished={family.name:progress['entries'] for family,_,progress in plans if progress.get('completed')}
+    finished={} if pm_only else {family.name:progress['entries'] for family,_,progress in plans if progress.get('completed')}
     selection_suffix=('_from_'+plans[0][0].name) if getattr(args,'start_family',None) else ''
     plot_options=dict(selection_suffix=selection_suffix,load_case=getattr(args,'load_case','compression'),
+                      model_cases=getattr(args,'model_cases','both'),
                       column_fy=step5_settings(args)['fy'],
+                      report_reference=getattr(args,'report_reference',None),
                       bending_axis_deg=getattr(args,'bending_axis_deg',0.),
                       configuration_label=('plate skip %d'%args.steel_plate_skip_count) if args.steel_plate_length else None)
+    if not getattr(args,'cufsm_report_dir',None):
+        references=[family_reference_args(args,family).report_reference for family,_,_ in plans]
+        # A shared benchmark is meaningful only for identical cross sections.
+        if references and all(ref==references[0] for ref in references):
+            plot_options['report_reference']=references[0]
     if finished:update_family_plot(batch_root,plans,finished,**plot_options)
+    base_args = args
     for index, (family, run, progress) in enumerate(plans, 1):
+        args = family_reference_args(base_args,family)
         prefix = '%d/%d %s' % (index, len(plans), family.name)
         print('\n=== FAMILY '+prefix+' ===', flush=True)
+        if pm_only and progress.get('step4'):
+            run_family_pm(args,family,run,abaqus,runner,prefix,state=progress.get('pm_state'))
+            print('FINISHED P-M ONLY: '+family.name,flush=True)
+            continue
         if progress.get('completed'):
             print('REUSE COMPLETED FAMILY: '+family.name+' (no primary analysis or ODB extraction)',flush=True)
+            refresh_step5_reference_plots(args,run,progress)
             if getattr(args,'pm_interaction',False):
                 run_family_pm(args,family,run,abaqus,runner,prefix,state=progress.get('pm_state'))
             continue
@@ -973,14 +1147,20 @@ def run_pipeline(args, runner=run_command, abaqus=None, _plans=None):
             require_file(step4_cae)
             (step4_cae.parent/STEP4_RECEIPT).write_text(json.dumps(step4_receipt(args,family,run),indent=2),encoding='utf-8')
         require_file(step4_cae)
+        if pm_only:
+            run_family_pm(args,family,run,abaqus,runner,prefix,state=progress.get('pm_state'))
+            print('FINISHED P-M ONLY: '+family.name,flush=True)
+            continue
         output = run/'imperfection'/getattr(args,'step5_directory',STEP5_DIRECTORY)
         if not progress.get('step5'):
             invoke([abaqus, 'cae', 'noGUI='+str(step5), '--', '--source-cae', step4_cae,
-            '--output-dir', output, '--fy', step5_settings(args)['fy'], '--cpus', args.cpus,
+            '--output-dir', output, '--models',*selected_models(args),
+            '--fy', step5_settings(args)['fy'], '--cpus', args.cpus,
+            *report_arguments(args),
             *(['--steel-plate-fy',args.steel_plate_fy] if args.steel_plate_length else []),
             '--initial-arc', '0.01', '--min-arc', '1e-8', '--max-arc', '0.05',
             '--max-increments', '5000', '--field-frequency', '1',
-                '--riks-extrapolation', args.riks_extrapolation,
+                '--riks-extrapolation', args.riks_extrapolation, *riks_build_arguments(args),
                 '--postpeak-stop-ratio', '0.70'], 'STEP5 BUILD')
         infos=check_step5_inputs(args,run)
         inputs=set(infos)
@@ -991,7 +1171,9 @@ def run_pipeline(args, runner=run_command, abaqus=None, _plans=None):
         # resume reach it, even if the saved BAT was generated on another computer.
         command=[abaqus,'cae','noGUI='+str(args.repo/'abaqus_step5_queue_nogui.py'),'--',
                  '--run-dir',output,'--cpus',args.cpus,'--gpus','auto','--ratio','0.70',
-                 '--stop-method',stop_methods.pop(),'--abaqus-cmd',abaqus]
+                 '--stop-method',stop_methods.pop(),'--abaqus-cmd',abaqus,
+                 '--parallel-jobs',getattr(args,'parallel_jobs','1')]
+        command.extend(report_arguments(args))
         if args.resume:command.append('--resume')
         invoke(command, 'STEP5 SOLVE QUEUE', cwd=output)
         results = read_json(output/'STEP5_queue_status.json')

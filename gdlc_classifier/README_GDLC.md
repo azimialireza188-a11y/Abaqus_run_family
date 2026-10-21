@@ -41,6 +41,23 @@ across each shared plate bolt node; exact constraint pairs remain unchanged.
 Direct and split-plate versions of one seam are oriented consistently, so a
 changed plate skip pattern does not create duplicate diagnostic seams.
 
+**Coordinate handling (v1.11.2).** Column-wall coordinates must match the INP
+within FP64 arithmetic roundoff or exact FP32 rounding before the INP precision
+is used for the wall geometry. Exported plate coordinates are retained, including
+the small initial adjustments made by Abaqus contact. Additional plate differences
+are accepted only when the matching job's current `.dat` contains a contact
+adjustment table and each differing component is within FP32 epsilon times that
+plate's local bounding-box extent. Member length and absolute instance position
+do not enlarge this additional allowance. A valid FP32-rounded component does
+not consume it. Larger differences, changed wall geometry, missing evidence and
+duplicate/incomplete node identities still fail. The DAT table can be truncated;
+its presence corroborates contact initialization, not each adjusted node.
+`summary.json` records the coordinate policy, accepted plate-node count, bounds
+and DAT hash under `geometry_coordinates`. Member-axis fitting uses only the
+longitudinal member shells; all plate nodes, elements and modal fields remain
+available for plate-response calculations. This processing does not alter the
+INP, ODB or the FE geometry and requires no new solve.
+
 **Classification corrections (v1.11.0).** `label` and `mode_character` describe
 the individual eigenvector. Several families above `--mixed-label-pct` give
 `MIXED_KINEMATICS` and a `MIXED` flag, even when the largest share has a clear
@@ -102,7 +119,7 @@ Python ≥ 3.10, `numpy`, `pyarrow`. Optional packages:
 
 ## Integrated pipeline (ODB → export → classification)
 `gdlc_mode_decomposition.py` now drives the whole chain. `abaqus_mfsm_export.py` must sit in the same folder; it is self-contained and needs no other modules. For every run folder found below the given path(s), the program:
-1. **Solves reference models** (only with `--solve-reference-models`): every `<run>_REF_G` / `<run>_REF_L` folder whose `.odb` is missing and solver destination is unused is solved with `abaqus job=… cpus=<N> interactive`; N = `--cpus N` (e.g. `--cpus 4`, written with a space), default all physical cores (Abaqus counts cores, not threads; a larger request is reduced to them with a warning, as in the rest of the pipeline). `--threads` only sets the Python/NumPy threads of the classifier.
+1. **Solves reference models** (only with `--solve-reference-models`): completed current ODBs are reused. Missing, failed or stale analyses are solved; files from an earlier unusable attempt are preserved in `superseded_attempts/` before retrying. Running/locked jobs are refused. The solver uses `abaqus job=… cpus=<N> interactive`; N = `--cpus N` (e.g. `--cpus 4`, written with a space), default all physical cores (Abaqus counts cores, not threads; a larger request is reduced to them with a warning, as in the rest of the pipeline). `--threads` only sets the Python/NumPy threads of the classifier.
 2. **Exports** `<job>.odb` by calling `abaqus python abaqus_mfsm_export.py --odb … --inp … --output-dir <run>\modal_export_gdlc`.
    - `--export auto` (default): an existing export is reused when the sha256 values it recorded match the current `.odb` and `.inp`.
    - `--export always`: a new export is written every time.
@@ -118,6 +135,30 @@ Which folders count as runs:
 Other `.odb` files, such as GMNIA or single-piece studies, are ignored. For npz exports, the element connectivity is read from the `.inp`, and the program checks that this `.inp` has the sha256 recorded in the export.
 
 ## Run
+
+With the Windows Python launcher, replace the leading `python` with
+`py -3.14`; do not write `py -3.14 python`. The extra `python` would be treated
+as a script filename, so the GDLC code would never start.
+
+From the repository's `gdlc_classifier` directory, solve/reuse a reference,
+export its modes if needed and classify them with:
+
+```bat
+py -3.14 gdlc_mode_decomposition.py "D:\path\to\run_REF_L" ^
+  --solve-reference-models ^
+  --export auto ^
+  --stiffness required ^
+  --cpus auto
+```
+
+The path may also select REF_G or another reference folder. For reference
+models, `--stiffness required` does not request a matrix job: stiffness/energy
+evaluation is unavailable for their equation constraints, while kinematic
+classification still runs. To solve/reuse references only, without modal export
+or classification, use `--solve-reference-models --solve-only --cpus auto`.
+The classifier runs with normal Python; it launches Abaqus internally when
+solving or exporting is necessary. Do not use `abaqus python` for this classifier.
+
 ```
 python gdlc_mode_decomposition.py "D:\CFS-Column"                  # every run below this folder
 python gdlc_mode_decomposition.py "D:\CFS-Column\<run>"            # a single run

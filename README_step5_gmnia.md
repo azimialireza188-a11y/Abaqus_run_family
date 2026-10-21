@@ -20,6 +20,29 @@
 
 ## دستور اجرا
 
+کنترل مسیرهای اجرای موازی، مسیرهای معمول ویندوز، پیشوند `\\?\` و نام‌های
+کوتاه 8.3 را با نرمال‌سازی و در صورت نیاز با هویت فایل‌سیستم مقایسه می‌کند.
+پوشه‌های اختصاصی scratch و workspace که لینک، junction یا reparse point
+باشند همچنان رد می‌شوند؛ حفاظت پیش از ساخت و پس از حل برقرار است.
+`--resume` برای خطایی که پیش از ارسال Job رخ داده و هیچ نتیجه‌ای ایجاد
+نکرده است، مقصد استفاده‌نشده را دوباره بررسی و اجرا می‌کند. نتایج موجود
+و پوشه‌های کاری باقی‌مانده بازنویسی یا حذف نمی‌شوند.
+
+در اجرای موازی، هر Job پوشهٔ کاری کوتاه و مستقل زیر `.queue_work` دارد.
+فایل‌های scratch در مسیر کوتاهِ مستقل زیر `.abq_scratch` در پوشهٔ کد
+قرار می‌گیرند؛ اگر طول مسیر کافی نباشد، مسیر TEMP بررسی می‌شود. طول مسیرهای
+داخلی Abaqus پیش از ارسال Job کنترل می‌شود و هیچ تنظیمی از منابع سیستم
+برای این منظور کاهش نمی‌یابد. scratch پس از توقف حلگر و تحویل خروجی پاک
+می‌شود؛ در صورت توقف نامطمئن یا قفل فعال، فایل‌ها برای بررسی حفظ می‌شوند.
+
+وجود ODB و کد خروج صفر به‌تنهایی موفقیت حل نیست. خطاهای پیش‌پردازش از
+`.dat` و لاگ اجرا بررسی و با علت واقعی گزارش می‌شوند. شکست همگرایی که
+منحنی قابل‌استخراج دارد، همچنان طبق قواعد فعلی نتایج ناتمام پردازش می‌شود.
+ODB اولیهٔ فاقد گام تحلیل، قابل استفاده برای نمودار نیست. برای حفظ نتایج
+قبلی، آن‌ها بازنویسی نمی‌شوند؛ در اجرای مقایسه می‌توان با `--resume` و
+`--plates-pm-directory "Step5_PM_FY240_LG_REF1_PERFECT_FIXED"` فقط مقصد P–M
+ورق‌دار را تغییر داد و مراحل قبلیِ سازگار را دوباره استفاده کرد.
+
 ### نمایش مرحلهٔ جاری در CMD
 
 ساخت مدل و اجرای صف اکنون پیام‌های فوری همراه ساعت چاپ می‌کنند. در اجرای
@@ -157,8 +180,9 @@ are retained. U3, UR1 and UR2 at the ends remain free; end warping is free.
 Compression uses fixed-direction shell-edge forces with `resultant=ON` per original
 edge length. Bending uses the Step3 consistent nodal CF3 forces scaled by
 `reference_stress`. Every P-M ray uses consistent nodal CF3 forces on the same
-end nodes. No reference points, kinematic end-plate couplings, contact stiffness
-ramp, discontinuous controls or line-search overrides are added.
+end nodes. No reference points, kinematic end-plate couplings or contact stiffness
+ramp are added. New inputs use the bounded Newton controls described below;
+the original physical loading/support model is unchanged.
 
 The default folders are `Step5_GMNIA_FY<fy>_LG_REF1` and
 `Step5_PM_FY<fy>_LG_REF1`. Metadata records
@@ -334,6 +358,36 @@ attempting the remaining queue, except that preflight conflicts stop submission
 before any job starts. Solver stdout/stderr is saved per job as
 `STEP5_*_queue_solver.log`.
 
+## Bounded Newton controls for new inputs
+
+New Step5 inputs use `--riks-controls robust`: Newton line search with at most
+four searches and `ANALYSIS=DISCONTINUOUS` (I0=8, IR=10). The default maximum
+16 equilibrium iterations, five increment attempts, minimum arc 1e-8 and
+5000-increment ceiling remain unchanged. No field/constraint accuracy tolerances,
+hardening, damping, supports, loads or geometric imperfections are changed.
+The line searches add element residual evaluations, not stiffness decompositions.
+This is a bounded correction strategy, not an unlimited solver retry sequence.
+
+Family/comparison/HSS pipelines default to `--riks-controls auto`: robust for
+new inputs, recorded controls for occupied inputs. Legacy metadata without this
+key means default Abaqus controls. `--riks-controls default` explicitly retains
+those original controls. Saved failed results remain failed and are not silently
+resubmitted or overwritten when source code changes.
+
+For a new numerical attempt with verified earlier stages, use `--resume` with
+`--riks-controls robust --pm-directory Step5_PM_ROBUST_V1` (choose an unused name).
+The common comparison directory option also reaches HSS. Standalone Step5 uses
+a fresh `--step5-directory` instead. Earlier Step4 provenance can be reused even
+when its old nonlinear delivery used default controls. Occupied destinations
+still reject a different explicitly requested policy.
+
+These controls cannot guarantee postbuckling continuation through a true
+perfect-model bifurcation. A converged observed response, rather than a solver
+exit code or merely decreasing LPF, is required for interpreting a selected point.
+Ordinary unfinished-curve selection is unchanged; no missing P-M point is invented.
+See the official [Newton convergence controls](https://docs.software.vt.edu/abaqusv2025/English/SIMACAEANLRefMap/simaanl-c-convergcriteria.htm)
+and [Riks bifurcation restrictions](https://docs.software.vt.edu/abaqusv2025/English/SIMACAEANLRefMap/simaanl-c-postbuckling.htm).
+
 ## Automatic plots and resource requests
 
 The queue extracts each finished/terminated readable ODB with its own matching
@@ -351,6 +405,16 @@ that do not reach the 70% drop or have solver errors are labeled accordingly.
 No strain/displacement sorting is applied to Riks snap-back paths. All cases
 must have field_frequency=1 for audited sequence alignment with automatic LPF
 history. The builder enforces this; existing sparse-output models are rejected.
+
+An apparent 70% LPF crossing is also screened against the preceding ascending
+response. If every available active end-response channel retraces that path
+within 1% of its pre-peak excursion, the peak is marked `PATH_REVIEW_REQUIRED`:
+the observed increment is retained for P-M display as `UNVERIFIED_PATH_RETRACE`,
+but is not certified as Pu/Mu. A decreasing displacement alone does not trigger
+this warning; real snap-back need not retrace the ascending path. This screen
+does not establish physical collapse or rule out bifurcation. The established
+selection policy for other unfinished curves is unchanged. Resume reassesses
+saved CSVs and refreshes reports without submitting an existing occupied job.
 
 If Matplotlib is unavailable in Abaqus Python, PNG uses the native CAE XY plotting
 engine; SVG always uses the standard library. No pip installation is required.
@@ -424,6 +488,23 @@ abaqus cae noGUI=abaqus_step5_gmnia.py -- ^
 
 ## Metadata sidecars
 
+Standalone `--models PERFECT` generates only the perfect nonlinear job;
+`--models STEP4_LG_mp` generates only that imperfect job from the source CAE.
+The family wrapper exposes the same choice as `--model-cases perfect`,
+`--model-cases imperfect`, or `--model-cases both` (default), for both Step5
+and P-M. Shared upstream reference/Step4 preparation is retained. Single-case
+family output directories have a case suffix unless explicitly overridden.
+
+Optional `--cufsm-report-dir "<report directory>"` reads `summary.xlsx` and stores
+the exact `builtup_4_pieces` area and x/z section moduli as plotting benchmarks.
+It uses the column `--fy`, independently of connector-plate yield strength.
+The queue and response extractor accept the same option to overlay benchmarks
+without rewriting existing solver metadata. AsFy appears on compression plots;
+SFy/ZFy appear on bending plots. P-M collection draws SFy/ZFy on M and AsFy on P.
+Other bending angles explicitly label the reported x benchmark, since exact
+diagonal plastic moduli are absent from this workbook. These plotting values do
+not replace the model's load references or normalization denominators.
+
 Every Step-5 job now also gets `<job>_step5.json` next to its INP: the same JSON that is stored in the
 model description of the CAE. The queue and `abaqus_step5_force_displacement.py` read the sidecar first,
 so `--cae` is only needed for older folders without sidecars. P-M interaction jobs
@@ -472,3 +553,112 @@ With the `--combo` cases of Step 4, this gives the strength-versus-amplitude tab
 `STEP5_PERFECT_FY…` has no imperfection. Riks then follows the symmetric fundamental path until yielding, or
 until round-off triggers a bifurcation. Its peak is an upper reference, used for normalisation and for
 checking the imperfection sensitivity; it is not a design strength.
+
+
+## Per-job time limit
+
+Every Step-5 nonlinear job, including P-M jobs for no plates, with plates and
+HSS, has a 60-minute wall-clock limit by default. No extra command option is
+needed. Each parallel slot has its own clock starting at submission; time
+waiting in the queue is excluded. Startup and license waiting after submission
+are included.
+
+At the limit the queue requests native Abaqus termination, preserves the saved
+results and starts the next job after shutdown is confirmed. Native shutdown
+and extraction add a short interval after the solve limit. If shutdown cannot
+be confirmed, the queue reports an error instead of reusing a potentially live
+solver's slot.
+
+The status is `TIME_LIMIT`, never a verified capacity. Usable saved frames follow
+the same P-M selection rule as other incomplete jobs. With no usable frames the
+job is explicitly omitted from the plot and the queue continues; no zero or
+invented capacity point is created. `--resume` skips these recorded time stops
+instead of spending another hour on the same job. To retry intentionally, use
+a new run directory. An already running queue must be restarted to load this
+source change.
+
+### HSS nominal references and convexity screening
+
+P-M plots containing a generated HSS automatically read its `hss_manifest.json`
+and add conditional ANSI/AISC 360-22 nominal references. The wall thickness is
+the actual Abaqus model thickness, without an inferred product reduction.
+Rounded finite-wall properties use the recorded centreline corner radius:
+outer radius = R + t/2 and inner radius = R - t/2. Known flat widths are measured
+between the corner tangencies, rather than estimated by subtracting 3t.
+
+`Pn` uses E3/E7, the recorded length and K=1 only for the generator's recorded
+pinned support condition. `P0_effective` is a separate short-section reference;
+neither is relabelled as gross yielding `Ag*Fy`. Square-HSS principal-axis `Mn`
+uses F7 with local slenderness and an effective compression flange with its
+shifted neutral axis. F7 in AISC 360-22 does not address sections with both
+slender webs and slender flanges: these retain a visible limitation and blank
+Mn, rather than a fabricated code capacity. Other axes/unsupported section
+shapes also retain an explicit scope limitation.
+
+Where both nominal strengths are available, a separately labelled H1-shaped
+reference uses Pn and Mn without phi/Omega. It is not an available-strength
+LRFD/ASD check or evidence of material/product compliance. The numeric values,
+assumptions and geometry source are written to
+`HSS_AISC360_nominal_reference.csv/.json` in the plot directory.
+
+`PM_convexity_diagnostics.json` screens each sampled FE domain and identifies
+nonconvex samples or missing intercepts. Numerical points and the selection
+policy stay unchanged. No outer convex hull, smoothing or capacity-increasing
+fit is applied: convexity alone cannot validate stability, an incomplete solve,
+or a design resistance. Demand orientations remain unassigned.
+
+## P-M response selection (response-v4-dual)
+
+For no-plate, plated and HSS jobs, both Perfect and imperfect, the queue and
+collector apply the same rule independently to P versus axial shortening and M
+versus end rotation. A component with identically zero applied load is excluded.
+The earliest accepted event selects BOTH P and M at one actual saved ODB frame;
+there is no pairing of independent maxima or interpolated capacity coordinates.
+
+A clear pre-peak knee needs at least 35% persistent tangent reduction, a load
+effect of at least 5% of the observed maximum (raised by a six-noise-scale gate),
+and strong broken-line evidence over both a straight line and smooth quadratic
+(BIC improvement >=10). Each side needs at least four real observations spanning
+8% of the loading-branch displacement range. Fits use equal displacement spacing;
+dense adaptive increments do not create extra support. Small coordinate jitter
+(up to 0.5% of branch span) is ignored for fitting. Real reversals bound the fit;
+a later post-peak tail cannot dilute a pre-peak knee. The selected row is the last
+observed frame before the fitted onset bracket, whose indices are recorded.
+
+The existing strong softening screen is retained. A recovered load drop is
+screened directly in solver order, with >=5% drop/recovery and several actual
+increments on each side, so a rotation reversal cannot erase it. These onset
+points remain provisional even if the solver completed. If no event is accepted,
+the existing verified-peak/ascending-endpoint/attained-maximum fallback remains.
+A retracing warning is preserved and cannot certify a provisional point or
+replace an earlier accepted event with a later maximum.
+
+`selection_response`, `selection_policy` and per-channel diagnostic evidence are
+exported with P-M points; paired response images identify the selected channel,
+and each XLSX Metadata sheet records the same policy and evidence. Collection
+re-evaluates saved validated curves under this rule without solving them again.
+No solver tolerances, run limits, geometry or material properties are changed by
+this selection policy; detecting a knee does not establish a design resistance.
+
+
+### Live CMD progress and per-job response reports
+
+The family/comparison and HSS pipelines relay CAE queue messages to the original
+terminal every 15 seconds. Each active job reports elapsed time, converged
+step/increment/attempt, LPF and its attained maximum. Adaptive Riks has no known
+completion percentage; the queue separately reports processed jobs / total jobs.
+Messages are also appended to `STEP5_console_progress.log`.
+
+After each P-M job exits and its ODB is closed/extracted, its solver directory gets
+`<job>_axial_bending_response.png`, `.svg` and `.xlsx`. Excel retains all original
+frame indices and synchronized P, shortening, M and rotation, including stopped
+analyses. `STEP5_response_paths.png/.svg` compares each completed history against
+its physical response and stored frame, with at most six jobs per page (`_002`,
+etc.). `PM_response_report_index.csv` records status and provenance.
+
+The comparison pipeline also updates `diagram/response_curves` and
+`diagram/04_PM_response_paths*.png/.svg` after each job. Existing cached paired
+figures/workbooks are reused. All reporting uses saved CSV, never another solve
+or an additional ODB extraction. A reporting failure preserves numerical results
+and is recorded separately; `--resume` repairs reports without resubmitting an
+occupied job. Selection criteria and capacity verification are unchanged.

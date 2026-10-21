@@ -273,7 +273,7 @@ CLASSES = ("G", "D", "L", "C", "O")
 CLASS_NAMES = {"G": "G global (rigid section)", "D": "D distortional (pieces' sections)",
                "L": "L local (folds fixed)", "C": "C relative rigid motion of the pieces",
                "O": "O other (extension, arc deformation)"}
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 
 
 # ----------------------------------------------------------------------------
@@ -1012,8 +1012,13 @@ def load_mesh(exp_dir: Path | None, meta: dict | None = None, inp_path: Path | N
             E[:, j] = [key[(a, int(b))] for a, b in zip(einst, lab_c)]
         if inp_path is not None:
             xyz, geometry = verified_input_coordinates(inst, lab, xyz, inp_path)
-    # member axis = direction most orthogonal to every shell normal
-    P = xyz[E[:, :4]] if E.shape[1] >= 4 else xyz[E]
+    # Plate normals must not participate in the longitudinal member-axis fit.
+    # Keep the full element array for the separate plate response/area metrics.
+    member = ~np.char.startswith(inst.astype(str), 'STEEL_PLATE_')
+    member_elements = E[np.all(member[E], axis=1)]
+    if not len(member_elements):
+        raise ValueError('No longitudinal member shell elements remain after excluding steel plates')
+    P = xyz[member_elements[:, :4]] if E.shape[1] >= 4 else xyz[member_elements]
     nrm = np.cross(P[:, 2] - P[:, 0], P[:, 3 if P.shape[1] > 3 else 1] - P[:, 1])
     nrm /= np.linalg.norm(nrm, axis=1, keepdims=True) + 1e-300
     w, V = np.linalg.eigh(nrm.T @ nrm)
@@ -4152,13 +4157,40 @@ def reference_check(run_dir: Path, rows) -> dict | None:
 # ----------------------------------------------------------------------------
 # 12. CLI
 # ----------------------------------------------------------------------------
+def plate_contact_adjustment_evidence(inp_path: Path) -> dict | None:
+    """Corroborate contact initialization, without claiming nodewise verification.
+
+    Abaqus can truncate this table. Its presence only permits the separately
+    bounded plate-coordinate policy; it never relaxes member verification.
+    """
+    dat = inp_path.with_suffix('.dat')
+    if not dat.is_file() or dat.stat().st_mtime_ns + 1_000_000_000 < inp_path.stat().st_mtime_ns:
+        return None
+    text = dat.read_text(errors='replace')
+    number = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[EeDd][-+]?\d+)?'
+    section = re.search(r'^\s*SECONDARY:[^\n]*\n\s*MAIN:[^\n]*\n'
+                        r'\s*DISTANCE\s*\n\s*NODE\s+ADJUSTED\s+REMARKS/WARNINGS\s*\n'
+                        r'\s*\d+\s+('+number+r')\s+ADJUSTED TO\s*\(', text, re.I | re.M)
+    if section is None:
+        return None
+    distance = float(section.group(1).replace('D', 'E').replace('d', 'e'))
+    if not math.isfinite(distance) or distance < 0:
+        return None
+    return dict(source=str(dat.resolve()), source_sha256=file_sha256(dat),
+                nodewise_verified=False,
+                meaning='Contact-adjustment table present; it may omit adjusted nodes')
+
+
 def verified_input_coordinates(inst, lab, xyz, inp_path: Path):
-    """Recover INP geometry only after matching every exported node and its precision.
+    """Recover member INP geometry and retain actual exported plate geometry.
 
     Converting ODB FP32 coordinates to FP64 cannot recover lost geometric relations.
-    Accept an exported value only if it matches the input to FP64 arithmetic error,
-    or is exactly the input's FP32 rounding. No geometric tolerance or smoothing is
-    used; real coordinate differences and incomplete/duplicate node maps fail.
+    Member coordinates must match FP64 roundoff or exact FP32 rounding. Plate
+    coordinates may also contain small contact-initialization adjustments: require
+    a current matching-job DAT contact table and bound only additional differences
+    by FP32 epsilon times that plate's local extent. This is a bounded geometry
+    allowance, not proof that every changed node was adjusted by contact.
+    No mode field is modified; duplicate/incomplete node maps still fail.
     """
     if not len(lab) or xyz.shape != (len(lab), 3) or len(inst) != len(lab) or not np.all(np.isfinite(xyz)):
         raise ValueError('Invalid/nonfinite exported node coordinates')
@@ -4180,15 +4212,45 @@ def verified_input_coordinates(inst, lab, xyz, inp_path: Path):
     with np.errstate(over='ignore', invalid='ignore'):
         single_match = xyz == expected.astype(np.float32).astype(np.float64)
     bad = ~(double_match | single_match)
+    plates = np.char.startswith(inst.astype(str), 'STEEL_PLATE_')
+    plate_bad = bad & plates[:, None]
+    contact_evidence = None
+    bounds = {}
+    if np.any(plate_bad):
+        contact_evidence = plate_contact_adjustment_evidence(inp_path)
+        if contact_evidence is not None:
+            for name in np.unique(inst[plates]):
+                rows = np.flatnonzero(inst == name)
+                # Differences along an exactly FP32-rounded high-station z remain
+                # valid. Only components failing that check consume this budget.
+                extent = float(np.max(np.ptp(expected[rows], axis=0)))
+                bound = float(np.finfo(np.float32).eps * extent)
+                if not math.isfinite(bound) or bound <= 0:
+                    continue
+                bounds[str(name)] = bound
+                bad[rows] &= np.abs(xyz[rows]-expected[rows]) > bound
     if np.any(bad):
         row, component = np.argwhere(bad)[0]
         raise ValueError('Export/INP coordinates differ beyond FP64 roundoff or exact FP32 rounding '
+                         '(plate exceptions require contact evidence and a local FP32-scale bound) '
                          f'at {keys[row]}, component {component+1}: '
                          f'export={xyz[row,component]:.17g}, INP={expected[row,component]:.17g}')
-    return expected, dict(source='inp_verified_against_export',
-                          verification='FP64_ROUNDOFF_OR_EXACT_FP32_ROUNDING',
-                          fp32_rounded_coordinate_count=int(np.count_nonzero(~double_match & single_match)),
-                          max_export_coordinate_difference=float(np.max(np.abs(xyz-expected))))
+    coordinates = expected.copy()
+    coordinates[plates] = xyz[plates]
+    provenance = dict(source='inp_verified_against_export',
+                      verification='FP64_ROUNDOFF_OR_EXACT_FP32_ROUNDING',
+                      fp32_rounded_coordinate_count=int(np.count_nonzero(~double_match & single_match)),
+                      max_export_coordinate_difference=float(np.max(np.abs(xyz-expected))))
+    if np.any(plates):
+        provenance.update(source='inp_member_and_modal_export_plates',
+                          member_coordinate_verification=provenance['verification'],
+                          verification='STRICT_MEMBER_WITH_BOUNDED_EXPORTED_PLATE_GEOMETRY',
+                          plate_coordinate_source='modal_export_preserved',
+                          plate_adjusted_node_count=int(np.count_nonzero(np.any(plate_bad, axis=1))),
+                          plate_contact_adjustment_evidence=contact_evidence,
+                          plate_additional_difference_bounds_mm=bounds,
+                          plate_difference_policy='FP32_EPSILON_TIMES_LOCAL_PLATE_EXTENT_WITH_CONTACT_EVIDENCE')
+    return coordinates, provenance
 
 
 def local_corner_translation_rows(g: RingGeom) -> np.ndarray:
@@ -4264,9 +4326,11 @@ def main(argv=None):
     ap.add_argument("--stiffness", choices=("auto", "always", "required", "never"), default=Settings.stiffness,
                     help="elastic stiffness export + strain-energy evaluation of the split: auto = run the "
                          "Abaqus matrix-generation job once per run (.inp sha256) and continue without the "
-                         "energy columns if it fails; always = regenerate; required = stop on failure; never")
+                         "energy columns if it fails; always = regenerate; required = stop on failure; "
+                         "never = skip. Reference models skip stiffness/energy evaluation in every mode")
     ap.add_argument("--solve-reference-models", action="store_true",
-                    help="solve <run>_REF_G / <run>_REF_L folders that have no .odb yet (Abaqus, --cpus)")
+                    help="solve/reuse <run>_REF_G / <run>_REF_L: reuse completed current ODBs; "
+                         "preserve failed/stale attempts before retrying (Abaqus, --cpus)")
     ap.add_argument("--solve-only", action="store_true",
                     help="with --solve-reference-models: solve/reuse references only; no export, stiffness or classification")
     ap.add_argument("--cpus", type=resources.cpu_request, default=None,
